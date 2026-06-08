@@ -54,23 +54,33 @@ def build_score_fn(mode: str, tokenizer, max_new_tokens: int, batch_size: int):
 
 def majority_vote_test(model, tokenizer, d_test, top_seeds, top_sigmas,
                        device, max_new_tokens, batch_size):
-    """Run majority vote over top-K perturbed models on the test set."""
+    """
+    Run majority vote over top-K perturbed models on the test set.
+
+    Outer loop: seeds (apply perturbation once, then batch all test examples).
+    Inner loop: batched generation over d_test.
+    Cost: K × ceil(|d_test| / batch_size) batched generation calls.
+    """
     from collections import Counter
     from tqdm import tqdm
 
     d = param_count(model)
-    n_correct = 0
+    # all_answers[i] collects one answer per seed for test example i
+    all_answers = [[] for _ in range(len(d_test))]
 
-    for ex in tqdm(d_test, desc="Majority vote (test)"):
-        prompt = gsm8k.format_prompt(ex, tokenizer)
-        inputs = tokenizer(prompt, return_tensors="pt",
-                           truncation=True, max_length=1024).to(device)
-        prompt_len = inputs["input_ids"].shape[1]
+    for seed, sigma in tqdm(zip(top_seeds, top_sigmas), total=len(top_seeds),
+                            desc="Majority vote (seeds)"):
+        delta = make_isotropic_delta(seed, d, sigma)
+        with with_delta(model, delta):
+            for batch_start in range(0, len(d_test), batch_size):
+                batch = d_test[batch_start: batch_start + batch_size]
+                prompts = [gsm8k.format_prompt(ex, tokenizer) for ex in batch]
+                inputs = tokenizer(
+                    prompts, return_tensors="pt", padding=True,
+                    truncation=True, max_length=1024,
+                ).to(device)
+                prompt_len = inputs["input_ids"].shape[1]
 
-        answers = []
-        for seed, sigma in zip(top_seeds, top_sigmas):
-            delta = make_isotropic_delta(seed, d, sigma)
-            with with_delta(model, delta):
                 with torch.no_grad():
                     out = model.generate(
                         **inputs,
@@ -78,13 +88,18 @@ def majority_vote_test(model, tokenizer, d_test, top_seeds, top_sigmas,
                         do_sample=False,
                         pad_token_id=tokenizer.pad_token_id,
                     )
-            text = tokenizer.decode(out[0, prompt_len:], skip_special_tokens=True)
-            answers.append(gsm8k.extract_answer(text))
 
-        voted = Counter(a for a in answers if a is not None)
+                for i, ex_idx in enumerate(range(batch_start,
+                                                  batch_start + len(batch))):
+                    text = tokenizer.decode(out[i, prompt_len:],
+                                            skip_special_tokens=True)
+                    all_answers[ex_idx].append(gsm8k.extract_answer(text))
+
+    n_correct = 0
+    for i, ex in enumerate(d_test):
+        voted = Counter(a for a in all_answers[i] if a is not None)
         best  = voted.most_common(1)[0][0] if voted else None
-        ref   = gsm8k.get_reference_answer(ex)
-        if gsm8k.is_correct(best, ref):
+        if gsm8k.is_correct(best, gsm8k.get_reference_answer(ex)):
             n_correct += 1
 
     return n_correct / len(d_test)
