@@ -62,7 +62,7 @@ def majority_vote_test(model, tokenizer, d_test, top_seeds, top_sigmas,
     n_correct = 0
 
     for ex in tqdm(d_test, desc="Majority vote (test)"):
-        prompt = gsm8k.format_prompt(ex["question"], tokenizer)
+        prompt = gsm8k.format_prompt(ex, tokenizer)
         inputs = tokenizer(prompt, return_tensors="pt",
                            truncation=True, max_length=1024).to(device)
         prompt_len = inputs["input_ids"].shape[1]
@@ -103,37 +103,56 @@ def main(args):
     )
     print(f"  D_train={len(d_train)}, D_test={len(d_test)}")
 
-    score_fn = build_score_fn(args.score_mode, tokenizer, args.max_new_tokens, args.batch_size)
+    checkpoint_path = args.output.replace(".json", "_checkpoint.json")
 
-    # Baseline (no perturbation)
-    print("\nBaseline accuracy...")
-    t0 = time.time()
-    baseline_acc = score_examples_generation(
-        model, tokenizer, d_test, device,
-        format_fn=gsm8k.format_prompt,
-        correct_fn=lambda text, ex: gsm8k.is_correct(
-            gsm8k.extract_answer(text), gsm8k.get_reference_answer(ex)
-        ),
-        max_new_tokens=args.max_new_tokens,
-        batch_size=args.batch_size,
-    )
-    print(f"  Baseline: {baseline_acc:.4f}  ({time.time()-t0:.0f}s)")
+    if args.resume_from and os.path.exists(args.resume_from):
+        print(f"\nResuming from {args.resume_from}...")
+        with open(args.resume_from) as f:
+            ckpt = json.load(f)
+        baseline_acc = ckpt["baseline_acc"]
+        selection    = {k: ckpt[k] for k in
+                        ("top_seeds", "top_sigmas", "top_scores", "all_scores",
+                         "all_seeds", "all_sigmas")}
+        print(f"  Loaded baseline_acc={baseline_acc:.4f}, "
+              f"top-1 train score={selection['top_scores'][0]:.4f}")
+    else:
+        score_fn = build_score_fn(args.score_mode, tokenizer, args.max_new_tokens, args.batch_size)
 
-    # Vanilla RandOpt selection
-    print(f"\nRandOpt selection (N={args.N}, K={args.K}, mode={args.score_mode})...")
-    t0 = time.time()
-    selection = randopt(
-        model, tokenizer, d_train,
-        N=args.N, K=args.K,
-        sigmas=args.sigmas,
-        device=device,
-        score_fn=score_fn,
-        base_seed=args.seed,
-    )
-    print(f"  Selection done in {time.time()-t0:.0f}s")
-    print(f"  Top-1 train score: {selection['top_scores'][0]:.4f}")
-    print(f"  Top-{args.K} train scores: min={min(selection['top_scores']):.4f}, "
-          f"mean={sum(selection['top_scores'])/len(selection['top_scores']):.4f}")
+        # Baseline (no perturbation)
+        print("\nBaseline accuracy...")
+        t0 = time.time()
+        baseline_acc = score_examples_generation(
+            model, tokenizer, d_test, device,
+            format_fn=gsm8k.format_prompt,
+            correct_fn=lambda text, ex: gsm8k.is_correct(
+                gsm8k.extract_answer(text), gsm8k.get_reference_answer(ex)
+            ),
+            max_new_tokens=args.max_new_tokens,
+            batch_size=args.batch_size,
+        )
+        print(f"  Baseline: {baseline_acc:.4f}  ({time.time()-t0:.0f}s)")
+
+        # Vanilla RandOpt selection
+        print(f"\nRandOpt selection (N={args.N}, K={args.K}, mode={args.score_mode})...")
+        t0 = time.time()
+        selection = randopt(
+            model, tokenizer, d_train,
+            N=args.N, K=args.K,
+            sigmas=args.sigmas,
+            device=device,
+            score_fn=score_fn,
+            base_seed=args.seed,
+        )
+        print(f"  Selection done in {time.time()-t0:.0f}s")
+        print(f"  Top-1 train score: {selection['top_scores'][0]:.4f}")
+        print(f"  Top-{args.K} train scores: min={min(selection['top_scores']):.4f}, "
+              f"mean={sum(selection['top_scores'])/len(selection['top_scores']):.4f}")
+
+        # Save checkpoint immediately so majority vote can be resumed independently
+        ckpt = {"model": args.model, "baseline_acc": baseline_acc, **selection}
+        with open(checkpoint_path, "w") as f:
+            json.dump(ckpt, f, indent=2)
+        print(f"  Checkpoint saved to {checkpoint_path}")
 
     # Majority vote test accuracy
     print("\nMajority vote on test set...")
@@ -179,4 +198,6 @@ if __name__ == "__main__":
                         choices=["generation", "loss"],
                         help="'loss' is 10x faster; 'generation' is faithful to paper")
     parser.add_argument("--output",        default="results/phase0.json")
+    parser.add_argument("--resume-from",   default=None,
+                        help="Path to a _checkpoint.json to skip selection and go straight to majority vote")
     main(parser.parse_args())
