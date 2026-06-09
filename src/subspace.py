@@ -124,7 +124,10 @@ def subspace_energy_ratio(
     G_delta = g_padded.reshape(m, n)  # (m, n)
 
     # coords[j] = u_j^T G_delta v_j
-    coords = torch.einsum("mr,mn,nr->r", U_r, G_delta, V_r)  # (r,)
+    # Computed as two cheap matmuls instead of a full einsum to avoid
+    # materialising intermediate m×n tensors: (m,r)^T @ (m,n) @ (n,r) → diag
+    tmp    = U_r.T @ G_delta          # (r, n)
+    coords = (tmp * V_r.T).sum(dim=1) # (r,)  diagonal of tmp @ V_r
 
     proj_norm_sq = coords.pow(2).sum().item()
     total_norm_sq = delta.float().pow(2).sum().item()

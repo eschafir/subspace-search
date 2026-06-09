@@ -116,7 +116,7 @@ def main(args):
         mean_minus = float(np.mean(rho_minus))
         ratio      = alignment_ratio(mean_plus, mean_minus)
 
-        print(f"  r={r:4d}:  ρ̄⁺={mean_plus:.4f}  ρ̄⁻={mean_minus:.4f}  "
+        print(f"  r={r:4d}:  ρ̄⁺={mean_plus:.3e}  ρ̄⁻={mean_minus:.3e}  "
               f"ratio={ratio:.2f}x  {'✓ PROCEED' if ratio >= 2 else '✗ weak'}")
 
         # Spearman correlation between ρ_r(all seeds) and their scores
