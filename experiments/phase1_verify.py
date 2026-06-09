@@ -20,6 +20,7 @@ import sys
 import torch
 import numpy as np
 from scipy.stats import spearmanr
+from tqdm import tqdm
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(__file__)))
 
@@ -107,10 +108,16 @@ def main(args):
         print(f"\nBuilding subspace (rank={r})...")
         U_r, V_r, m, n, pad = build_subspace(grad, rank=r)
 
-        rho_plus  = [subspace_energy_ratio(make_isotropic_delta(s, d, sig), U_r, V_r, m, n, pad)
-                     for s, sig in zip(top_seeds, top_sigmas)]
-        rho_minus = [subspace_energy_ratio(make_isotropic_delta(s, d, sig), U_r, V_r, m, n, pad)
-                     for s, sig in zip(non_top_seeds, non_top_sigmas)]
+        rho_plus = [
+            subspace_energy_ratio(make_isotropic_delta(s, d, sig), U_r, V_r, m, n, pad)
+            for s, sig in tqdm(zip(top_seeds, top_sigmas), total=len(top_seeds),
+                               desc=f"  r={r:4d} top-K  ", leave=False)
+        ]
+        rho_minus = [
+            subspace_energy_ratio(make_isotropic_delta(s, d, sig), U_r, V_r, m, n, pad)
+            for s, sig in tqdm(zip(non_top_seeds, non_top_sigmas), total=len(non_top_seeds),
+                               desc=f"  r={r:4d} non-top", leave=False)
+        ]
 
         mean_plus  = float(np.mean(rho_plus))
         mean_minus = float(np.mean(rho_minus))
@@ -120,8 +127,11 @@ def main(args):
               f"ratio={ratio:.2f}x  {'✓ PROCEED' if ratio >= 2 else '✗ weak'}")
 
         # Spearman correlation between ρ_r(all seeds) and their scores
-        all_rho = [subspace_energy_ratio(make_isotropic_delta(s, d, sig), U_r, V_r, m, n, pad)
-                   for s, sig in zip(all_seeds, all_sigmas)]
+        all_rho = [
+            subspace_energy_ratio(make_isotropic_delta(s, d, sig), U_r, V_r, m, n, pad)
+            for s, sig in tqdm(zip(all_seeds, all_sigmas), total=len(all_seeds),
+                               desc=f"  r={r:4d} all    ", leave=False)
+        ]
         rho_spearman, p_val = spearmanr(all_rho, all_scores)
 
         results_by_rank[r] = {
