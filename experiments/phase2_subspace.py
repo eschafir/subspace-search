@@ -19,7 +19,7 @@ import numpy as np
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(__file__)))
 
-from src.models import load, with_delta, param_count
+from src.models import load, with_delta, param_count, best_gpu
 from src.perturbation import make_isotropic_delta, make_subspace_delta
 from src.benchmarks import gsm8k
 from src.evaluate import score_examples_loss, score_examples_generation
@@ -88,7 +88,7 @@ def compute_score_matrix(model, tokenizer, d_test, all_seeds, all_sigmas,
 
 
 def main(args):
-    device = "cuda" if torch.cuda.is_available() else "cpu"
+    device = best_gpu()
     os.makedirs(os.path.dirname(args.output), exist_ok=True)
 
     print(f"Loading {args.model}...")

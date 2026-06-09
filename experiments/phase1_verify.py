@@ -23,7 +23,7 @@ from scipy.stats import spearmanr
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(__file__)))
 
-from src.models import load, param_count
+from src.models import load, param_count, best_gpu
 from src.perturbation import make_isotropic_delta
 from src.benchmarks import gsm8k
 from src.evaluate import score_examples_loss
@@ -33,7 +33,7 @@ from src.metrics import alignment_ratio
 
 
 def main(args):
-    device = "cuda" if torch.cuda.is_available() else "cpu"
+    device = best_gpu()
     os.makedirs(os.path.dirname(args.output), exist_ok=True)
 
     print(f"Loading {args.model}...")
