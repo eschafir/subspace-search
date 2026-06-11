@@ -6,22 +6,28 @@ This script implements the axis-aligned coordinate-sparse subspace search:
   2. Masks out all but the top-M most sensitive parameters.
   3. Samples random weight perturbations only inside this sparse coordinate subspace.
   4. Runs RandOpt selection on D_train and majority vote on D_test.
+
+Optimizations:
+  * Sparse memory context manager: only transfers and updates the top-M parameters (100k)
+    in-place on GPU, bypassing the overhead of transferring 1.5B parameters on every step.
+  * Checkpoint resuming: saves selection state and top_indices, allowing immediate resuming
+    and bypassing the selection phase if it was already completed.
 """
 import argparse
 import json
 import os
 import sys
 import time
+import contextlib
 import torch
 import torch.nn.functional as F
 from tqdm import tqdm
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(__file__)))
 
-from src.models import load, with_delta, param_count, best_gpu
+from src.models import load, with_delta, param_count, best_gpu, trainable_params
 from src.benchmarks import gsm8k
 from src.evaluate import score_examples_loss, score_examples_generation
-from src.randopt import score_perturbation
 
 
 def compute_fisher_diagonal(
@@ -79,37 +85,56 @@ def compute_fisher_diagonal(
     return fisher_diagonal / len(examples)
 
 
-def make_sparse_delta(seed: int, d: int, top_indices: torch.Tensor, sigma: float) -> torch.Tensor:
-    """Generate a parameter-sparse weight perturbation from a seed."""
-    g = torch.Generator()
-    g.manual_seed(seed)
-    
-    M = top_indices.numel()
-    z = torch.randn(M, generator=g, dtype=torch.float32) * sigma
-    
-    delta = torch.zeros(d, dtype=torch.float32)
-    delta[top_indices] = z
-    return delta
+@contextlib.contextmanager
+def with_sparse_delta(param_mappings, z: torch.Tensor):
+    """
+    Temporarily apply a sparse delta vector z (M elements) to model parameters.
+    Only transfers and updates the active coordinates in-place on GPU.
+    """
+    for p, local_idxs, matching_global_idxs in param_mappings:
+        chunk = z[matching_global_idxs].to(dtype=p.dtype, device=p.device)
+        p.data.view(-1)[local_idxs].add_(chunk)
+    try:
+        yield
+    finally:
+        for p, local_idxs, matching_global_idxs in param_mappings:
+            chunk = z[matching_global_idxs].to(dtype=p.dtype, device=p.device)
+            p.data.view(-1)[local_idxs].sub_(chunk)
 
 
-def majority_vote_test(model, tokenizer, d_test, top_seeds, top_indices, sigma,
-                       device, max_new_tokens, batch_size):
-    """Run majority vote test inference for sparsity-perturbed models."""
+def score_perturbation_sparse(
+    model,
+    tokenizer,
+    examples: list[dict],
+    device: str,
+    param_mappings,
+    z: torch.Tensor,
+    score_fn,
+) -> float:
+    """Score model with temporarily applied sparse delta z."""
+    with with_sparse_delta(param_mappings, z):
+        return score_fn(model, tokenizer, examples, device)
+
+
+def majority_vote_test_sparse(model, tokenizer, d_test, top_seeds, param_mappings, M, sigma,
+                              device, max_new_tokens, batch_size):
+    """Run majority vote test inference using optimized sparse delta application."""
     from collections import Counter
     
-    d = param_count(model)
     n_correct = 0
-    
     for ex in tqdm(d_test, desc="Majority vote test"):
-        prompt  = gsm8k.format_prompt(ex["question"], tokenizer)
+        prompt  = gsm8k.format_prompt(ex, tokenizer)
         inputs  = tokenizer(prompt, return_tensors="pt",
                             truncation=True, max_length=1024).to(device)
         plen    = inputs["input_ids"].shape[1]
 
         answers = []
         for seed in top_seeds:
-            delta = make_sparse_delta(seed, d, top_indices, sigma)
-            with with_delta(model, delta):
+            g = torch.Generator()
+            g.manual_seed(seed)
+            z = torch.randn(M, generator=g, dtype=torch.float32) * sigma
+            
+            with with_sparse_delta(param_mappings, z):
                 with torch.no_grad():
                     out = model.generate(
                         **inputs, max_new_tokens=max_new_tokens,
@@ -158,25 +183,57 @@ def main(args):
         )
     print(f"  Baseline Accuracy: {baseline_acc:.4f}")
 
-    # Compute Fisher diagonal
-    print(f"\nComputing Fisher diagonal on D_loc ({len(d_loc)})...")
-    model.gradient_checkpointing_enable()
-    fisher_diagonal = compute_fisher_diagonal(
-        model, tokenizer, d_loc, device,
-        format_full_fn=gsm8k.format_full,
-        format_prompt_fn=gsm8k.format_prompt,
-    )
-    model.gradient_checkpointing_disable()
+    # Checkpoint setup
+    ckpt_path = args.output.replace(".json", "_checkpoint.json")
+    all_scores = []
+    all_seeds = []
+    top_indices = None
+    start_i = 0
 
-    # Get top-M parameter indices
-    print(f"Selecting top-M={args.M} sensitive parameters...")
-    fisher_gpu = fisher_diagonal.to(device)
-    _, top_indices = torch.topk(fisher_gpu, args.M, largest=True)
-    top_indices = top_indices.cpu()
-    del fisher_gpu
-    torch.cuda.empty_cache()
+    if os.path.exists(ckpt_path):
+        print(f"\nLoading selection checkpoint from {ckpt_path}...")
+        with open(ckpt_path) as f:
+            ckpt = json.load(f)
+        all_scores = ckpt["all_scores"]
+        all_seeds = ckpt["all_seeds"]
+        top_indices = torch.tensor(ckpt["top_indices"])
+        start_i = ckpt["last_index"] + 1
+        print(f"  Loaded checkpoint: {len(all_scores)} completed iterations. Top indices shape: {top_indices.shape}")
+    else:
+        # Compute Fisher diagonal
+        print(f"\nComputing Fisher diagonal on D_loc ({len(d_loc)})...")
+        model.gradient_checkpointing_enable()
+        fisher_diagonal = compute_fisher_diagonal(
+            model, tokenizer, d_loc, device,
+            format_full_fn=gsm8k.format_full,
+            format_prompt_fn=gsm8k.format_prompt,
+        )
+        model.gradient_checkpointing_disable()
 
-    # Define score function (teacher-forced loss)
+        # Get top-M parameter indices
+        print(f"Selecting top-M={args.M} sensitive parameters...")
+        fisher_gpu = fisher_diagonal.to(device)
+        _, top_indices = torch.topk(fisher_gpu, args.M, largest=True)
+        top_indices = top_indices.cpu()
+        del fisher_gpu
+        torch.cuda.empty_cache()
+
+    # Precompute parameter mapping for optimized sparse updates
+    print("Precomputing layer-wise mappings for sparse VRAM updates...")
+    params = trainable_params(model)
+    offset = 0
+    param_mappings = []
+    for p in params:
+        n = p.numel()
+        mask = (top_indices >= offset) & (top_indices < offset + n)
+        if mask.any():
+            matching_global_idxs = torch.where(mask)[0]
+            local_idxs = top_indices[matching_global_idxs] - offset
+            param_mappings.append((p, local_idxs, matching_global_idxs))
+        offset += n
+    print(f"  Sparsity mapped successfully. {len(param_mappings)} parameter tensors affected.")
+
+    # Define score function (teacher-forced SFT loss)
     def score_fn(model, tok, examples, device):
         return score_examples_loss(
             model, tok, examples, device,
@@ -186,36 +243,49 @@ def main(args):
         )
 
     # Sparsity RandOpt Selection
-    print(f"\nSparsity RandOpt selection (N={args.N}, K={args.K}, M={args.M})...")
-    t0 = time.time()
-    all_scores = []
-    all_seeds  = []
-    
-    for i in tqdm(range(args.N), desc="Sparsity RandOpt sampling"):
-        seed  = args.seed + i
-        delta = make_sparse_delta(seed, d, top_indices, args.sigma)
-        score = score_perturbation(model, tokenizer, d_train, device, delta, score_fn)
-        all_scores.append(score)
-        all_seeds.append(seed)
+    if start_i < args.N:
+        print(f"\nSparsity RandOpt selection (N={args.N}, K={args.K}, M={args.M})...")
+        t0 = time.time()
+        
+        for i in tqdm(range(start_i, args.N), desc="Sparsity RandOpt sampling"):
+            seed = args.seed + i
+            g = torch.Generator()
+            g.manual_seed(seed)
+            z = torch.randn(args.M, generator=g, dtype=torch.float32) * args.sigma
+            
+            score = score_perturbation_sparse(model, tokenizer, d_train, device, param_mappings, z, score_fn)
+            all_scores.append(score)
+            all_seeds.append(seed)
+            
+            # Save checkpoint every 50 iterations
+            if (i + 1) % 50 == 0 or (i + 1) == args.N:
+                with open(ckpt_path, "w") as f:
+                    json.dump({
+                        "last_index": i,
+                        "all_scores": all_scores,
+                        "all_seeds": all_seeds,
+                        "top_indices": top_indices.tolist()
+                    }, f, indent=2)
 
+        print(f"  Selection completed/resumed in {time.time()-t0:.0f}s")
+        
     ranked = sorted(zip(all_scores, all_seeds), reverse=True)
     top_k  = ranked[:args.K]
     top_seeds = [s for _, s in top_k]
     
-    print(f"  Selection completed in {time.time()-t0:.0f}s")
     print(f"  Top-1 SFT Loss: {top_k[0][0]:.4f}")
     
     # Majority vote test accuracy
     print("\nRunning majority vote on test set...")
     t0 = time.time()
-    mv_acc = majority_vote_test(
-        model, tokenizer, d_test, top_seeds, top_indices, args.sigma,
+    mv_acc = majority_vote_test_sparse(
+        model, tokenizer, d_test, top_seeds, param_mappings, args.M, args.sigma,
         device, args.max_new_tokens, args.batch_size,
     )
     print(f"  Sparsity RandOpt (K={args.K}) test accuracy: {mv_acc:.4f}  ({time.time()-t0:.0f}s)")
     print(f"  Improvement over baseline: {mv_acc - baseline_acc:+.4f}")
 
-    # Save results
+    # Save final results
     output = {
         "model": args.model,
         "N": args.N,
@@ -230,6 +300,10 @@ def main(args):
     with open(args.output, "w") as f:
         json.dump(output, f, indent=2)
     print(f"\nSaved results to {args.output}")
+
+    # Remove temporary selection checkpoint on success
+    if os.path.exists(ckpt_path):
+        os.remove(ckpt_path)
 
 
 if __name__ == "__main__":
