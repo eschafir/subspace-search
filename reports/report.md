@@ -165,11 +165,26 @@ where P_r is the d×r subspace basis (columns = vec(u_j ⊗ v_j) from SVD of res
 
 ## 7. Phase 1 Results
 
-*Phase 1 is currently running. This section will be updated with results.*
+The Phase 1 subspace alignment verification was run on Qwen-1.5B-Instruct using $D_{\text{loc}} = 50$ SFT examples for gradient localization and $K = 50$ top perturbations from Phase 0. 
 
-<!-- Uncomment when phase1.json is available:
-![Phase 1 Alignment](figures/fig6_phase1_alignment.png)
--->
+**Gradient Localization:**
+*   Gradient norm on $D_{\text{loc}}$: **11.6879**
+
+**Subspace Energy Ratio ($\rho_r$) Results:**
+
+| Rank $r$ | $\bar{\rho}^+$ (Top-$K$) | $\bar{\rho}^-$ (Non-Top) | Ratio $\bar{\rho}^+ / \bar{\rho}^-$ | Status |
+|---|---|---|---|---|
+| 10 | $5.915 \times 10^{-9}$ | $6.413 \times 10^{-9}$ | 0.92x | ✗ weak |
+| 50 | $3.297 \times 10^{-8}$ | $3.135 \times 10^{-8}$ | 1.05x | ✗ weak |
+| 100 | $6.328 \times 10^{-8}$ | $6.484 \times 10^{-8}$ | 0.98x | ✗ weak |
+| 200 | $1.281 \times 10^{-7}$ | $1.284 \times 10^{-7}$ | 1.00x | ✗ weak |
+| 500 | $3.247 \times 10^{-7}$ | $3.210 \times 10^{-7}$ | 1.01x | ✗ weak |
+
+**Decision Gate:**
+*   Best Ratio: **1.05x** (at rank 50) $\rightarrow$ **INVESTIGATE_ALTERNATIVE_BASIS**
+
+The alignment is extremely close to the theoretical isotropic random projection expectation of $r/d$. The decision gate output indicates that SFT gradient SVD is not a viable subspace basis for Subspace RandOpt, requiring the investigation of alternative bases (such as PCA of top-K deltas, layer-wise SVD, or parameter-sparse Fisher diagonal).
+
 
 ---
 
