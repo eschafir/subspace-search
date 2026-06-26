@@ -13,7 +13,8 @@ project_root = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(_
 sys.path.insert(0, project_root)
 
 from dotenv import load_dotenv
-load_dotenv()  # load environment variables from .env file
+env_path = os.path.join(project_root, ".env")
+load_dotenv(dotenv_path=env_path)  # load environment variables from absolute .env path
 
 from src.models import load, best_gpu
 
