@@ -12,10 +12,40 @@ from rank_bm25 import BM25Okapi
 project_root = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 sys.path.insert(0, project_root)
 
+from dotenv import load_dotenv
+load_dotenv()  # load environment variables from .env file
+
 from src.models import load, best_gpu
 
 def run_llm_inference(prompt: str, model, tokenizer, device: str, max_new_tokens: int = 128) -> str:
-    """Helper to run inference on local Qwen or custom HF model."""
+    """Helper to run inference on local Qwen or custom HF model, or Nvidia NIM API."""
+    if isinstance(model, str) and model.startswith("nvidia/"):
+        # Nvidia NIM API call
+        from openai import OpenAI
+        api_key = os.environ.get("NVIDIA_API_KEY")
+        if not api_key:
+            raise ValueError("Error: NVIDIA_API_KEY is not set in environment or .env file.")
+            
+        client = OpenAI(
+            base_url="https://integrate.api.nvidia.com/v1",
+            api_key=api_key
+        )
+        
+        # Strip the 'nvidia/' prefix to get the official NIM model key
+        nim_model_name = model.replace("nvidia/", "")
+        
+        response = client.chat.completions.create(
+            model=nim_model_name,
+            messages=[
+                {"role": "system", "content": "You are a helpful, logical AI search assistant."},
+                {"role": "user", "content": prompt}
+            ],
+            temperature=0.0,
+            max_tokens=max_new_tokens
+        )
+        return response.choices[0].message.content.strip()
+        
+    # Local HF model fallback
     messages = [
         {"role": "system", "content": "You are a helpful, logical AI search assistant."},
         {"role": "user", "content": prompt}
@@ -53,7 +83,7 @@ def parse_stage4_response(response: str) -> tuple[str, float]:
 
 def main():
     parser = argparse.ArgumentParser(description="HIVE Phase 1: Offline Teacher Target Generation")
-    parser.add_argument("--model", type=str, default="qwen-1.5b", help="Model key to load from src/models.py")
+    parser.add_argument("--model", type=str, default="qwen-1.5b", help="Model key to load from src/models.py or NIM API path")
     parser.add_argument("--dataset", type=str, default="nfcorpus", help="Dataset name: 'nfcorpus', 'mm-bright/MM-BRIGHT', or a Hugging Face dataset ID")
     parser.add_argument("--split", type=str, default=None, help="Hugging Face dataset split/domain name (e.g. 'academia', or 'all' for all MM-BRIGHT splits)")
     parser.add_argument("--num-queries", type=int, default=10, help="Number of queries to process per dataset split")
@@ -61,9 +91,15 @@ def main():
     parser.add_argument("--output-path", type=str, default="results/distillation_targets.json", help="Output path for the generated targets")
     args = parser.parse_args()
     
-    device = best_gpu()
-    print(f"Loading teacher model {args.model} on {device}...")
-    model, tokenizer = load(args.model, device=device)
+    if args.model.startswith("nvidia/"):
+        print(f"Using Nvidia NIM API model: {args.model}")
+        model = args.model
+        tokenizer = None
+        device = "cpu"
+    else:
+        device = best_gpu()
+        print(f"Loading teacher model {args.model} on {device}...")
+        model, tokenizer = load(args.model, device=device)
     
     # Load existing targets if file exists to enable resuming
     targets = []
