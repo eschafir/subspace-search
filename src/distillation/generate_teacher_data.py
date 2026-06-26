@@ -18,6 +18,15 @@ load_dotenv(dotenv_path=env_path)  # load environment variables from absolute .e
 
 from src.models import load, best_gpu
 
+def clean_html(text: str) -> str:
+    """Remove HTML tags like <p>, <img>, <a>, etc. from text for clean LLM prompts."""
+    if not text:
+        return ""
+    text = re.sub(r"<img[^>]*>", "", text)
+    text = re.sub(r"<[^>]+>", "", text)
+    text = text.replace("&lt;", "<").replace("&gt;", ">").replace("&amp;", "&").replace("&quot;", '"').replace("&#39;", "'")
+    return text.strip()
+
 def run_llm_inference(prompt: str, model, tokenizer, device: str, max_new_tokens: int = 128) -> str:
     """Helper to run inference on local Qwen or custom HF model, or Nvidia NIM API."""
     if isinstance(model, str) and model.startswith("nvidia/"):
@@ -32,19 +41,44 @@ def run_llm_inference(prompt: str, model, tokenizer, device: str, max_new_tokens
             api_key=api_key
         )
         
-        # Strip the 'nvidia/' prefix to get the official NIM model key
         nim_model_name = model.replace("nvidia/", "")
         
-        response = client.chat.completions.create(
-            model=nim_model_name,
-            messages=[
-                {"role": "system", "content": "You are a helpful, logical AI search assistant."},
-                {"role": "user", "content": prompt}
-            ],
-            temperature=0.0,
-            max_tokens=max_new_tokens
-        )
-        return response.choices[0].message.content.strip()
+        try:
+            response = client.chat.completions.create(
+                model=nim_model_name,
+                messages=[
+                    {"role": "system", "content": "You are a helpful, logical AI search assistant."},
+                    {"role": "user", "content": prompt}
+                ],
+                temperature=0.0,
+                max_tokens=max_new_tokens
+            )
+            msg = response.choices[0].message
+            content = msg.content or getattr(msg, "reasoning_content", None)
+            if content and content.strip():
+                return content.strip()
+        except Exception as e:
+            print(f"  NIM API call failed for {nim_model_name}: {e}. Retrying with fallback model...")
+            
+        # Fallback if primary model failed or returned empty content
+        fallback_model = "meta/llama-3.3-70b-instruct"
+        print(f"  Warning: Primary NIM model {nim_model_name} returned empty or failed. Querying fallback {fallback_model}...")
+        try:
+            response = client.chat.completions.create(
+                model=fallback_model,
+                messages=[
+                    {"role": "system", "content": "You are a helpful, logical AI search assistant."},
+                    {"role": "user", "content": prompt}
+                ],
+                temperature=0.0,
+                max_tokens=max_new_tokens
+            )
+            msg = response.choices[0].message
+            content = msg.content or getattr(msg, "reasoning_content", None) or ""
+            return content.strip()
+        except Exception as e:
+            print(f"  Fallback NIM API model failed as well: {e}")
+            return "[Inference Failed]"
         
     # Local HF model fallback
     messages = [
@@ -270,7 +304,7 @@ def main():
             
             # 2. HIVE Stage 2: Compensatory Query Synthesis
             stage2_prompt = (
-                f"Original Search Query: \"{query_text}\"\n\n"
+                f"Original Search Query: \"{clean_html(query_text)}\"\n\n"
                 f"Here are the top retrieved document snippets from a first-pass search:\n"
                 f"{snippets_text}\n\n"
                 f"Determine the logical/semantic reasoning gap or missing vocabulary concepts "
@@ -308,10 +342,10 @@ def main():
                 is_ground_truth = "Yes" if doc_id in ground_truth_ids else "No"
                 
                 stage4_prompt = (
-                    f"Original User Query: \"{query_text}\"\n\n"
+                    f"Original User Query: \"{clean_html(query_text)}\"\n\n"
                     f"Candidate Document (ID: {doc_id}):\n"
                     f"Title: {doc['title']}\n"
-                    f"Content: {doc['text']}\n\n"
+                    f"Content: {clean_html(doc['text'])}\n\n"
                     f"Analyze if this document is logically relevant to answering the original user query. "
                     f"Explain your step-by-step reasoning (the rationale). "
                     f"Then, assign a relevance score between 0.0 (completely irrelevant) and 5.0 (perfect answer). "
