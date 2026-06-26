@@ -32,6 +32,7 @@ def run_llm_inference(prompt: str, model, tokenizer, device: str, max_new_tokens
     if isinstance(model, str) and model.startswith("nvidia/"):
         # Nvidia NIM API call
         from openai import OpenAI
+        import time
         api_key = os.environ.get("NVIDIA_API_KEY")
         if not api_key:
             raise ValueError("Error: NVIDIA_API_KEY is not set in environment or .env file.")
@@ -43,42 +44,50 @@ def run_llm_inference(prompt: str, model, tokenizer, device: str, max_new_tokens
         
         nim_model_name = model.replace("nvidia/", "")
         
-        try:
-            response = client.chat.completions.create(
-                model=nim_model_name,
-                messages=[
-                    {"role": "system", "content": "You are a helpful, logical AI search assistant."},
-                    {"role": "user", "content": prompt}
-                ],
-                temperature=0.0,
-                max_tokens=max_new_tokens
-            )
-            msg = response.choices[0].message
-            content = msg.content or getattr(msg, "reasoning_content", None)
-            if content and content.strip():
-                return content.strip()
-        except Exception as e:
-            print(f"  NIM API call failed for {nim_model_name}: {e}. Retrying with fallback model...")
+        # Try with primary model (up to 3 retries)
+        for attempt in range(3):
+            try:
+                response = client.chat.completions.create(
+                    model=nim_model_name,
+                    messages=[
+                        {"role": "system", "content": "You are a helpful, logical AI search assistant."},
+                        {"role": "user", "content": prompt}
+                    ],
+                    temperature=0.0,
+                    max_tokens=max_new_tokens
+                )
+                msg = response.choices[0].message
+                content = msg.content or getattr(msg, "reasoning_content", None)
+                if content and content.strip():
+                    return content.strip()
+            except Exception as e:
+                print(f"  Attempt {attempt+1} failed for {nim_model_name}: {e}.")
+                if attempt < 2:
+                    time.sleep(2)
             
-        # Fallback if primary model failed or returned empty content
+        # Fallback if primary model failed or returned empty content after retries
         fallback_model = "meta/llama-3.3-70b-instruct"
         print(f"  Warning: Primary NIM model {nim_model_name} returned empty or failed. Querying fallback {fallback_model}...")
-        try:
-            response = client.chat.completions.create(
-                model=fallback_model,
-                messages=[
-                    {"role": "system", "content": "You are a helpful, logical AI search assistant."},
-                    {"role": "user", "content": prompt}
-                ],
-                temperature=0.0,
-                max_tokens=max_new_tokens
-            )
-            msg = response.choices[0].message
-            content = msg.content or getattr(msg, "reasoning_content", None) or ""
-            return content.strip()
-        except Exception as e:
-            print(f"  Fallback NIM API model failed as well: {e}")
-            return "[Inference Failed]"
+        for attempt in range(3):
+            try:
+                response = client.chat.completions.create(
+                    model=fallback_model,
+                    messages=[
+                        {"role": "system", "content": "You are a helpful, logical AI search assistant."},
+                        {"role": "user", "content": prompt}
+                    ],
+                    temperature=0.0,
+                    max_tokens=max_new_tokens
+                )
+                msg = response.choices[0].message
+                content = msg.content or getattr(msg, "reasoning_content", None) or ""
+                if content.strip():
+                    return content.strip()
+            except Exception as e:
+                print(f"  Fallback attempt {attempt+1} failed: {e}")
+                if attempt < 2:
+                    time.sleep(2)
+        return "[Inference Failed]"
         
     # Local HF model fallback
     messages = [
@@ -347,14 +356,14 @@ def main():
                     f"Title: {doc['title']}\n"
                     f"Content: {clean_html(doc['text'])}\n\n"
                     f"Analyze if this document is logically relevant to answering the original user query. "
-                    f"Explain your step-by-step reasoning (the rationale). "
+                    f"Explain your step-by-step reasoning (the rationale) in 2-3 concise sentences. "
                     f"Then, assign a relevance score between 0.0 (completely irrelevant) and 5.0 (perfect answer). "
                     f"Output your response in the format:\n"
                     f"Rationale: <your reasoning here>\n"
                     f"Score: <number from 0.0 to 5.0>"
                 )
                 print(f"  Verifying Doc {doc_id} (Is Ground Truth: {is_ground_truth})...")
-                verification_output = run_llm_inference(stage4_prompt, model, tokenizer, device, max_new_tokens=150)
+                verification_output = run_llm_inference(stage4_prompt, model, tokenizer, device, max_new_tokens=512)
                 
                 rationale, score = parse_stage4_response(verification_output)
                 rationales[doc_id] = rationale
