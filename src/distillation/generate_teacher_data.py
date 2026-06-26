@@ -94,6 +94,9 @@ def main():
                 except Exception as e:
                     print(f"Error listing MM-BRIGHT splits: {e}")
                     return
+            elif args.split and "," in args.split:
+                split_names = [s.strip() for s in args.split.split(",") if s.strip()]
+                print(f"User specified {len(split_names)} splits to process: {split_names}")
             else:
                 split_names = [args.split if args.split else "academia"]
         else:
