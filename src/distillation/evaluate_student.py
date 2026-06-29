@@ -3,9 +3,7 @@ import sys
 import json
 import argparse
 import random
-import string
 import torch
-import torch.nn as nn
 import torch.nn.functional as F
 from tqdm import tqdm
 from datasets import load_dataset
@@ -16,18 +14,34 @@ sys.path.insert(0, project_root)
 
 from src.models import load, best_gpu
 
-class BottleneckAdapter(nn.Module):
-    """Bottleneck adapter layer mapping hidden_dim -> hidden_dim, initialized as an identity matrix."""
-    def __init__(self, hidden_dim):
-        super().__init__()
-        self.linear = nn.Linear(hidden_dim, hidden_dim, bias=False)
-        with torch.no_grad():
-            self.linear.weight.copy_(torch.eye(hidden_dim))
-            
-    def forward(self, x):
-        return self.linear(x)
+# Common English stop words
+stop_words = set([
+    'i', 'me', 'my', 'myself', 'we', 'our', 'ours', 'ourselves', 'you', 'your', 'yours', 'yourself', 'yourselves',
+    'he', 'him', 'his', 'himself', 'she', 'her', 'hers', 'herself', 'it', 'its', 'itself', 'they', 'them', 'their',
+    'theirs', 'themselves', 'what', 'which', 'who', 'whom', 'this', 'that', 'these', 'those', 'am', 'is', 'are',
+    'was', 'were', 'be', 'been', 'being', 'have', 'has', 'had', 'having', 'do', 'does', 'did', 'doing', 'a', 'an',
+    'the', 'and', 'but', 'if', 'or', 'because', 'as', 'until', 'while', 'of', 'at', 'by', 'for', 'with', 'about',
+    'against', 'between', 'into', 'through', 'during', 'before', 'after', 'above', 'below', 'to', 'from', 'up',
+    'down', 'in', 'out', 'on', 'off', 'over', 'under', 'again', 'further', 'then', 'once', 'here', 'there', 'when',
+    'where', 'why', 'how', 'all', 'any', 'both', 'each', 'few', 'more', 'most', 'other', 'some', 'such', 'no',
+    'nor', 'not', 'only', 'own', 'same', 'so', 'than', 'too', 'very', 's', 't', 'can', 'will', 'just', 'don',
+    'should', 'now', 'd', 'll', 'm', 'o', 're', 've', 'y', 'ain', 'aren', 'could', 'didn', 'doesn', 'hadn',
+    'hasn', 'haven', 'isn', 'ma', 'mightn', 'mustn', 'needn', 'shan', 'shouldn', 'wasn', 'weren', 'won', 'wouldn'
+])
 
-def evaluate_split(model, tokenizer, query_lut, adapter, device, dataset_name, split_name, batch_size=32, logit_threshold=0.0, keep_mask=None):
+def clean_query_text(text):
+    """Remove HTML, punctuation, and common English stop-words from queries before tokenization."""
+    import re
+    # Remove HTML tags
+    text = re.sub(r'<[^>]+>', '', text)
+    # Keep only alphanumeric characters and spaces
+    text = ''.join(c for c in text if c.isalnum() or c.isspace())
+    # Filter stop words
+    words = text.split()
+    filtered = [w for w in words if w.lower() not in stop_words]
+    return ' '.join(filtered)
+
+def evaluate_split(model, tokenizer, query_lut, device, dataset_name, split_name, batch_size=32, logit_threshold=0.0, filter_stopwords=False):
     """Evaluate V-SPLADE student model on a single split, returning MRR@10 and NDCG@10."""
     print(f"\nEvaluating split: '{split_name}'...")
     
@@ -46,7 +60,6 @@ def evaluate_split(model, tokenizer, query_lut, adapter, device, dataset_name, s
     w_p_list = []
     
     model.eval()
-    adapter.eval()
     vocab_size = model.config.vocab_size
     
     print("Encoding visual documents...")
@@ -80,16 +93,13 @@ def evaluate_split(model, tokenizer, query_lut, adapter, device, dataset_name, s
             )
             hidden_states = outputs.hidden_states[-1] # (batch, seq, hidden)
             
-            # Apply Adapter projection
-            projected_hidden_states = adapter(hidden_states)
-            
             # Max-pool logits in chunks to prevent VRAM spikes
             attention_mask = doc_inputs["attention_mask"].unsqueeze(-1)
             chunk_size = 20000
             z_p_parts = []
             for start in range(0, vocab_size, chunk_size):
                 weight_chunk = model.lm_head.weight[start : start + chunk_size]
-                logits_chunk = torch.matmul(projected_hidden_states, weight_chunk.t())
+                logits_chunk = torch.matmul(hidden_states, weight_chunk.t())
                 logits_chunk = logits_chunk * attention_mask + (1 - attention_mask) * -1e9
                 z_p_chunk, _ = torch.max(logits_chunk, dim=1)
                 z_p_parts.append(z_p_chunk)
@@ -101,12 +111,6 @@ def evaluate_split(model, tokenizer, query_lut, adapter, device, dataset_name, s
                 z_p = z_p - logit_threshold
                 
             w_p = torch.log1p(torch.relu(z_p)) # (batch, vocab_size)
-            
-            # Apply stop-word mask if provided
-            if keep_mask is not None:
-                w_p = w_p * keep_mask.unsqueeze(0)
-            
-            # Store on CPU to avoid running out of memory
             w_p_list.append(w_p.cpu())
             
     # Concatenate all doc sparse representations
@@ -125,8 +129,14 @@ def evaluate_split(model, tokenizer, query_lut, adapter, device, dataset_name, s
         if not gold_ids:
             continue
             
+        # Clean query text at the string level if requested (preventing BPE subword degradation)
+        if filter_stopwords:
+            q_text_cleaned = clean_query_text(q_text)
+        else:
+            q_text_cleaned = q_text
+            
         # Get query tokens and weights via LUT
-        query_token_ids = tokenizer(q_text, add_special_tokens=False)["input_ids"]
+        query_token_ids = tokenizer(q_text_cleaned, add_special_tokens=False)["input_ids"]
         if not query_token_ids:
             continue
             
@@ -135,10 +145,6 @@ def evaluate_split(model, tokenizer, query_lut, adapter, device, dataset_name, s
         with torch.no_grad():
             w_q_weights = F.softplus(query_lut[query_token_ids]).cpu()
             w_q[query_token_ids] = w_q_weights
-            
-        # Apply stop-word mask to query if provided
-        if keep_mask is not None:
-            w_q = w_q * keep_mask.cpu()
             
         # Match via dot-product: s = w_q^T w_p
         scores = torch.sum(w_q.unsqueeze(0) * w_p_all, dim=1) # (num_docs,)
@@ -179,14 +185,14 @@ def evaluate_split(model, tokenizer, query_lut, adapter, device, dataset_name, s
     return mrr, ndcg
 
 def main():
-    parser = argparse.ArgumentParser(description="HIVE-to-V-SPLADE Phase 3: Student Evaluation with Bottleneck Adapter")
+    parser = argparse.ArgumentParser(description="HIVE-to-V-SPLADE Phase 3: Student Evaluation (LUT-Only)")
     parser.add_argument("--checkpoint-path", type=str, default="results/vsplade_student_checkpoint.pt", help="Path to distilled student weights")
     parser.add_argument("--model", type=str, default="qwen-1.5b", help="Model key of the backbone")
     parser.add_argument("--dataset", type=str, default="mm-bright/MM-BRIGHT", help="Dataset name on Hugging Face")
     parser.add_argument("--test-splits", type=str, default="academia,biology,physics,philosophy,psychology,quant,quantumcomputing,robotics,law", help="Comma-separated list of held-out splits to evaluate")
     parser.add_argument("--batch-size", type=int, default=32, help="Batch size for encoding documents")
     parser.add_argument("--logit-threshold", type=float, default=0.0, help="Logit threshold to enforce sparsity")
-    parser.add_argument("--filter-stopwords", action="store_true", help="Zero out weights for punctuation and common stop-words")
+    parser.add_argument("--filter-stopwords", action="store_true", help="Clean queries at string level by removing stop-words before BPE tokenization")
     args = parser.parse_args()
     
     device = best_gpu()
@@ -200,52 +206,8 @@ def main():
         
     print(f"Loading checkpoint weights from {args.checkpoint_path}...")
     checkpoint = torch.load(args.checkpoint_path, map_location=device)
-    
-    # Initialize and load Bottleneck Adapter
-    hidden_dim = model.config.hidden_size
-    model_dtype = next(model.parameters()).dtype
-    adapter = BottleneckAdapter(hidden_dim).to(device).to(model_dtype)
-    adapter.load_state_dict(checkpoint["adapter_state_dict"])
-    adapter.eval()
-    
     query_lut = checkpoint["query_lut"].to(device)
     print("Checkpoint loaded successfully.")
-    
-    vocab_size = model.config.vocab_size
-    
-    # Build stop-word and punctuation mask if requested
-    keep_mask = None
-    if args.filter_stopwords:
-        stop_words = set([
-            'i', 'me', 'my', 'myself', 'we', 'our', 'ours', 'ourselves', 'you', 'your', 'yours', 'yourself', 'yourselves',
-            'he', 'him', 'his', 'himself', 'she', 'her', 'hers', 'herself', 'it', 'its', 'itself', 'they', 'them', 'their',
-            'theirs', 'themselves', 'what', 'which', 'who', 'whom', 'this', 'that', 'these', 'those', 'am', 'is', 'are',
-            'was', 'were', 'be', 'been', 'being', 'have', 'has', 'had', 'having', 'do', 'does', 'did', 'doing', 'a', 'an',
-            'the', 'and', 'but', 'if', 'or', 'because', 'as', 'until', 'while', 'of', 'at', 'by', 'for', 'with', 'about',
-            'against', 'between', 'into', 'through', 'during', 'before', 'after', 'above', 'below', 'to', 'from', 'up',
-            'down', 'in', 'out', 'on', 'off', 'over', 'under', 'again', 'further', 'then', 'once', 'here', 'there', 'when',
-            'where', 'why', 'how', 'all', 'any', 'both', 'each', 'few', 'more', 'most', 'other', 'some', 'such', 'no',
-            'nor', 'not', 'only', 'own', 'same', 'so', 'than', 'too', 'very', 's', 't', 'can', 'will', 'just', 'don',
-            'should', 'now', 'd', 'll', 'm', 'o', 're', 've', 'y', 'ain', 'aren', 'could', 'didn', 'doesn', 'hadn',
-            'hasn', 'haven', 'isn', 'ma', 'mightn', 'mustn', 'needn', 'shan', 'shouldn', 'wasn', 'weren', 'won', 'wouldn'
-        ])
-        
-        def is_stop_word_or_punct(token_idx):
-            word = tokenizer.decode([token_idx]).strip().lower()
-            if not word:
-                return True
-            if all(char in string.punctuation or char.isspace() for char in word):
-                return True
-            if word in stop_words:
-                return True
-            return False
-            
-        print("Building stop-words and punctuation vocabulary mask...")
-        keep_mask = torch.ones(vocab_size, dtype=torch.bool, device=device)
-        for idx in range(vocab_size):
-            if is_stop_word_or_punct(idx):
-                keep_mask[idx] = False
-        print(f"Kept {keep_mask.sum().item()} / {vocab_size} tokens (excluded {vocab_size - keep_mask.sum().item()} stop-words/punctuation tokens).")
     
     # Parse test splits
     test_splits = [s.strip() for s in args.test_splits.split(",") if s.strip()]
@@ -258,8 +220,8 @@ def main():
     
     for split in test_splits:
         res = evaluate_split(
-            model, tokenizer, query_lut, adapter, device, args.dataset, split, 
-            batch_size=args.batch_size, logit_threshold=args.logit_threshold, keep_mask=keep_mask
+            model, tokenizer, query_lut, device, args.dataset, split, 
+            batch_size=args.batch_size, logit_threshold=args.logit_threshold, filter_stopwords=args.filter_stopwords
         )
         if res:
             mrr, ndcg = res
