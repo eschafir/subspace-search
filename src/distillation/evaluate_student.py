@@ -5,6 +5,7 @@ import argparse
 import random
 import string
 import torch
+import torch.nn as nn
 import torch.nn.functional as F
 from tqdm import tqdm
 from datasets import load_dataset
@@ -15,7 +16,18 @@ sys.path.insert(0, project_root)
 
 from src.models import load, best_gpu
 
-def evaluate_split(model, tokenizer, query_lut, device, dataset_name, split_name, batch_size=32, logit_threshold=0.0, keep_mask=None):
+class BottleneckAdapter(nn.Module):
+    """Bottleneck adapter layer mapping hidden_dim -> hidden_dim, initialized as an identity matrix."""
+    def __init__(self, hidden_dim):
+        super().__init__()
+        self.linear = nn.Linear(hidden_dim, hidden_dim, bias=False)
+        with torch.no_grad():
+            self.linear.weight.copy_(torch.eye(hidden_dim))
+            
+    def forward(self, x):
+        return self.linear(x)
+
+def evaluate_split(model, tokenizer, query_lut, adapter, device, dataset_name, split_name, batch_size=32, logit_threshold=0.0, keep_mask=None):
     """Evaluate V-SPLADE student model on a single split, returning MRR@10 and NDCG@10."""
     print(f"\nEvaluating split: '{split_name}'...")
     
@@ -34,6 +46,7 @@ def evaluate_split(model, tokenizer, query_lut, device, dataset_name, split_name
     w_p_list = []
     
     model.eval()
+    adapter.eval()
     vocab_size = model.config.vocab_size
     
     print("Encoding visual documents...")
@@ -67,13 +80,16 @@ def evaluate_split(model, tokenizer, query_lut, device, dataset_name, split_name
             )
             hidden_states = outputs.hidden_states[-1] # (batch, seq, hidden)
             
+            # Apply Adapter projection
+            projected_hidden_states = adapter(hidden_states)
+            
             # Max-pool logits in chunks to prevent VRAM spikes
             attention_mask = doc_inputs["attention_mask"].unsqueeze(-1)
             chunk_size = 20000
             z_p_parts = []
             for start in range(0, vocab_size, chunk_size):
                 weight_chunk = model.lm_head.weight[start : start + chunk_size]
-                logits_chunk = torch.matmul(hidden_states, weight_chunk.t())
+                logits_chunk = torch.matmul(projected_hidden_states, weight_chunk.t())
                 logits_chunk = logits_chunk * attention_mask + (1 - attention_mask) * -1e9
                 z_p_chunk, _ = torch.max(logits_chunk, dim=1)
                 z_p_parts.append(z_p_chunk)
@@ -163,7 +179,7 @@ def evaluate_split(model, tokenizer, query_lut, device, dataset_name, split_name
     return mrr, ndcg
 
 def main():
-    parser = argparse.ArgumentParser(description="HIVE-to-V-SPLADE Phase 3: Student Evaluation")
+    parser = argparse.ArgumentParser(description="HIVE-to-V-SPLADE Phase 3: Student Evaluation with Bottleneck Adapter")
     parser.add_argument("--checkpoint-path", type=str, default="results/vsplade_student_checkpoint.pt", help="Path to distilled student weights")
     parser.add_argument("--model", type=str, default="qwen-1.5b", help="Model key of the backbone")
     parser.add_argument("--dataset", type=str, default="mm-bright/MM-BRIGHT", help="Dataset name on Hugging Face")
@@ -184,7 +200,14 @@ def main():
         
     print(f"Loading checkpoint weights from {args.checkpoint_path}...")
     checkpoint = torch.load(args.checkpoint_path, map_location=device)
-    model.lm_head.load_state_dict(checkpoint["lm_head_state_dict"])
+    
+    # Initialize and load Bottleneck Adapter
+    hidden_dim = model.config.hidden_size
+    model_dtype = next(model.parameters()).dtype
+    adapter = BottleneckAdapter(hidden_dim).to(device).to(model_dtype)
+    adapter.load_state_dict(checkpoint["adapter_state_dict"])
+    adapter.eval()
+    
     query_lut = checkpoint["query_lut"].to(device)
     print("Checkpoint loaded successfully.")
     
@@ -235,7 +258,7 @@ def main():
     
     for split in test_splits:
         res = evaluate_split(
-            model, tokenizer, query_lut, device, args.dataset, split, 
+            model, tokenizer, query_lut, adapter, device, args.dataset, split, 
             batch_size=args.batch_size, logit_threshold=args.logit_threshold, keep_mask=keep_mask
         )
         if res:

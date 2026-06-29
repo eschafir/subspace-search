@@ -4,6 +4,7 @@ import json
 import argparse
 import random
 import torch
+import torch.nn as nn
 import torch.nn.functional as F
 from tqdm import tqdm
 from datasets import load_dataset
@@ -13,6 +14,17 @@ project_root = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(_
 sys.path.insert(0, project_root)
 
 from src.models import load, best_gpu
+
+class BottleneckAdapter(nn.Module):
+    """Bottleneck adapter layer mapping hidden_dim -> hidden_dim, initialized as an identity matrix."""
+    def __init__(self, hidden_dim):
+        super().__init__()
+        self.linear = nn.Linear(hidden_dim, hidden_dim, bias=False)
+        with torch.no_grad():
+            self.linear.weight.copy_(torch.eye(hidden_dim))
+            
+    def forward(self, x):
+        return self.linear(x)
 
 def load_all_documents(dataset_name, splits):
     """Load all document texts across the specified splits and return as a mapping of doc_id -> text."""
@@ -32,12 +44,12 @@ def load_all_documents(dataset_name, splits):
     return corpus
 
 def main():
-    parser = argparse.ArgumentParser(description="HIVE-to-V-SPLADE Phase 2: Student Distillation")
+    parser = argparse.ArgumentParser(description="HIVE-to-V-SPLADE Phase 2: Student Distillation with Bottleneck Adapter")
     parser.add_argument("--targets-path", type=str, default="results/mm_bright_train_teacher_targets.json", help="Path to HIVE generated teacher targets")
     parser.add_argument("--model", type=str, default="qwen-1.5b", help="Model key to load from src/models.py as the backbone")
     parser.add_argument("--output-path", type=str, default="results/vsplade_student_checkpoint.pt", help="Path to save the distilled student weights")
     parser.add_argument("--epochs", type=int, default=3, help="Number of training epochs")
-    parser.add_argument("--lr-lm-head", type=float, default=1e-4, help="Learning rate for LM head")
+    parser.add_argument("--lr-adapter", type=float, default=1e-4, help="Learning rate for Bottleneck Adapter")
     parser.add_argument("--lr-query-lut", type=float, default=1e-3, help="Learning rate for query LUT")
     parser.add_argument("--lambda-rank", type=float, default=1.0, help="Weight for Rank Alignment loss")
     parser.add_argument("--lambda-sparsity", type=float, default=1e-4, help="Weight for Sparsity regularization")
@@ -68,23 +80,26 @@ def main():
     corpus = load_all_documents("mm-bright/MM-BRIGHT", splits)
     print(f"Total corpus documents loaded: {len(corpus)}")
     
-    # Freeze model backbone and only train the LM head
+    # Freeze model backbone and lm_head completely
     for p in model.parameters():
         p.requires_grad = False
-    for p in model.lm_head.parameters():
-        p.requires_grad = True
         
+    # Initialize the Bottleneck Adapter (mapping hidden_dim -> hidden_dim)
+    hidden_dim = model.config.hidden_size
+    model_dtype = next(model.parameters()).dtype
+    adapter = BottleneckAdapter(hidden_dim).to(device).to(model_dtype)
+    
     # Initialize query lookup table (Lut) as a trainable 1D tensor parameter
     vocab_size = model.config.vocab_size
-    query_lut = torch.nn.Parameter(torch.ones(vocab_size, dtype=torch.float32, device=device))
+    query_lut = nn.Parameter(torch.ones(vocab_size, dtype=torch.float32, device=device))
     
-    # Check optimizer parameter list
+    # Check optimizer parameter list: optimize ONLY adapter and query_lut
     optimizer = torch.optim.AdamW([
-        {"params": model.lm_head.parameters(), "lr": args.lr_lm_head},
+        {"params": adapter.parameters(), "lr": args.lr_adapter},
         {"params": [query_lut], "lr": args.lr_query_lut}
     ], weight_decay=0.01)
     
-    print("Starting distillation training loop...")
+    print("Starting distillation training loop with Bottleneck Adapter...")
     for epoch in range(args.epochs):
         random.seed(epoch)
         random.shuffle(targets)
@@ -122,10 +137,12 @@ def main():
                     output_hidden_states=True
                 )
                 hidden_states = outputs.hidden_states[-1] # (batch_size, seq_len, hidden_dim)
-                
-            # 3. Project to vocabulary using trainable LM head in memory-efficient chunks
-            # Shape: (batch_size, seq_len, hidden_dim)
-            batch_size, seq_len, hidden_dim = hidden_states.shape
+            
+            # 3. Apply trainable Bottleneck Adapter
+            projected_hidden_states = adapter(hidden_states) # (batch_size, seq_len, hidden_dim)
+            batch_size = projected_hidden_states.shape[0]
+            
+            # 4. Project to vocabulary using frozen LM head in memory-efficient chunks
             attention_mask = doc_inputs["attention_mask"].unsqueeze(-1) # (batch_size, seq_len, 1)
             
             # We compute logits and max-pool in chunks to prevent VRAM spikes
@@ -133,7 +150,7 @@ def main():
             z_p_parts = []
             for i in range(0, vocab_size, chunk_size):
                 weight_chunk = model.lm_head.weight[i:i+chunk_size] # (chunk_size, hidden_dim)
-                logits_chunk = torch.matmul(hidden_states, weight_chunk.t()) # (batch_size, seq_len, chunk_size)
+                logits_chunk = torch.matmul(projected_hidden_states, weight_chunk.t()) # (batch_size, seq_len, chunk_size)
                 
                 # Apply attention mask to set padded token logits to a very small value
                 logits_chunk = logits_chunk * attention_mask + (1 - attention_mask) * -1e9
@@ -145,7 +162,7 @@ def main():
             z_p = torch.cat(z_p_parts, dim=1) # (batch_size, vocab_size)
             w_p = torch.log1p(torch.relu(z_p)) # (batch_size, vocab_size)
             
-            # 4. Process Query inputs and representations
+            # 5. Process Query inputs and representations
             query_token_ids = tokenizer(q_text, add_special_tokens=False)["input_ids"]
             if not query_token_ids:
                 continue
@@ -157,7 +174,7 @@ def main():
             # Compute student scores: s_SPLADE = w_q^T w_p
             scores_student = torch.sum(w_q.unsqueeze(0) * w_p, dim=1) # (batch_size,)
             
-            # 5. Compute Lexical Gating Loss (Objective 1)
+            # 6. Compute Lexical Gating Loss (Objective 1)
             loss_lexical = 0.0
             q_tokens = set(query_token_ids)
             comp_tokens = set(tokenizer(comp_query, add_special_tokens=False)["input_ids"])
@@ -193,8 +210,7 @@ def main():
                 
             loss_lexical = loss_lexical / batch_size
             
-            # 6. Compute Rank Alignment Loss (Objective 2: Margin MSE)
-            # Fetch teacher scores for candidates
+            # 7. Compute Rank Alignment Loss (Objective 2: Margin MSE)
             scores_teacher = [float(relevance_scores.get(d_id, 0.0)) for d_id in candidate_ids]
             
             margins_student = []
@@ -211,7 +227,7 @@ def main():
             else:
                 loss_rank = torch.tensor(0.0, device=device)
                 
-            # 7. Compute Sparsity Regularization
+            # 8. Compute Sparsity Regularization
             loss_sparsity = torch.mean(w_p)
             
             # Joint Objective
@@ -246,9 +262,9 @@ def main():
         
     # Save checkpoint
     os.makedirs(os.path.dirname(args.output_path), exist_ok=True)
-    print(f"Saving student model weights to {args.output_path}...")
+    print(f"Saving student adapter and LUT weights to {args.output_path}...")
     torch.save({
-        "lm_head_state_dict": model.lm_head.state_dict(),
+        "adapter_state_dict": adapter.state_dict(),
         "query_lut": query_lut.detach().cpu(),
         "args": vars(args)
     }, args.output_path)
