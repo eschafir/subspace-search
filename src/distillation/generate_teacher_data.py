@@ -227,7 +227,7 @@ def main():
                 try:
                     corpus_ds = load_dataset(args.dataset, "corpus", split="corpus")
                     queries_ds = load_dataset(args.dataset, "queries", split="queries")
-                    qrels_ds = load_dataset(args.dataset, default=None, split=split_name)
+                    qrels_ds = load_dataset(args.dataset, split=split_name)
                 except Exception as e:
                     print(f"Error loading BEIR dataset '{args.dataset}': {e}")
                     continue
