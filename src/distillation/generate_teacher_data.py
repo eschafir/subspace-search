@@ -241,18 +241,24 @@ def main():
                 
                 # Map corpus
                 for row in corpus_ds:
-                    doc_id = row["_id"]
+                    raw_doc_id = row["_id"]
+                    # Namespace documents to prevent any global key overlaps
+                    doc_id = f"{args.dataset.replace('/', '_')}_{raw_doc_id}"
                     corpus[doc_id] = {"_id": doc_id, "title": row.get("title", ""), "text": row.get("text", "")}
                     
                 # Map queries
                 for row in queries_ds:
-                    q_id = row["_id"]
+                    raw_q_id = row["_id"]
+                    # Namespace query IDs to prevent collision with MM-BRIGHT targets
+                    q_id = f"{args.dataset.replace('/', '_')}_{split_name}_{raw_q_id}"
                     queries[q_id] = {"_id": q_id, "text": row.get("text", "")}
                     
                 # Map relevance
                 for row in qrels_ds:
-                    q_id = row["query-id"]
-                    doc_id = row["corpus-id"]
+                    raw_q_id = row["query-id"]
+                    raw_doc_id = row["corpus-id"]
+                    q_id = f"{args.dataset.replace('/', '_')}_{split_name}_{raw_q_id}"
+                    doc_id = f"{args.dataset.replace('/', '_')}_{raw_doc_id}"
                     score = int(row.get("score", 1))
                     if score >= 1:
                         qrels.setdefault(q_id, []).append(doc_id)
