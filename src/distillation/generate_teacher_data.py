@@ -224,10 +224,15 @@ def main():
             elif args.dataset.startswith("beir/") or "beir" in args.dataset.lower():
                 # BEIR dataset loader (e.g., beir/fiqa, beir/dbpedia-entity)
                 print(f"Loading BEIR dataset '{args.dataset}' components...")
+                # Format to match standard Hugging Face BEIR naming scheme:
+                # corpus & queries are under "BeIR/dataset"
+                # qrels are under "BeIR/dataset-qrels"
+                dataset_prefix = args.dataset
+                qrels_dataset = f"{args.dataset}-qrels"
                 try:
-                    corpus_ds = load_dataset(args.dataset, "corpus", split="corpus")
-                    queries_ds = load_dataset(args.dataset, "queries", split="queries")
-                    qrels_ds = load_dataset(args.dataset, split=split_name)
+                    corpus_ds = load_dataset(dataset_prefix, "corpus", split="corpus")
+                    queries_ds = load_dataset(dataset_prefix, "queries", split="queries")
+                    qrels_ds = load_dataset(qrels_dataset, split=split_name)
                 except Exception as e:
                     print(f"Error loading BEIR dataset '{args.dataset}': {e}")
                     continue
