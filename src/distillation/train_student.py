@@ -15,21 +15,38 @@ sys.path.insert(0, project_root)
 
 from src.models import load, best_gpu
 
-def load_all_documents(dataset_name, splits):
-    """Load all document texts across the specified splits and return as a mapping of doc_id -> text."""
+def load_all_documents(targets):
+    """Load all document texts dynamically based on the dataset and split in each target."""
     corpus = {}
-    for split in splits:
-        print(f"Loading documents for split '{split}'...")
-        try:
-            ds = load_dataset(dataset_name, "documents", split=split)
-            for row in ds:
-                doc_id = row.get("id")
-                doc_text = row.get("content", row.get("text", row.get("caption", row.get("llm_image_caption", ""))))
-                if not doc_text:
-                    doc_text = "[No text extraction available]"
-                corpus[doc_id] = doc_text
-        except Exception as e:
-            print(f"Error loading split {split}: {e}")
+    # Group splits by dataset
+    grouped = {}
+    for t in targets:
+        dataset = t.get("dataset", "mm-bright/MM-BRIGHT")
+        split = t["split"]
+        grouped.setdefault(dataset, set()).add(split)
+        
+    for dataset, splits in grouped.items():
+        for split in splits:
+            print(f"Loading documents for dataset '{dataset}', split '{split}'...")
+            try:
+                if "mm-bright" in dataset.lower():
+                    ds = load_dataset(dataset, "documents", split=split)
+                    for row in ds:
+                        doc_id = row.get("id")
+                        doc_text = row.get("content", row.get("text", row.get("caption", row.get("llm_image_caption", ""))))
+                        if not doc_text:
+                            doc_text = "[No text extraction available]"
+                        corpus[doc_id] = doc_text
+                else:
+                    ds = load_dataset(dataset, split=split)
+                    for idx, row in enumerate(ds):
+                        doc_id = row.get("doc_id") or row.get("image_filename") or f"{split}_DOC-{idx}"
+                        doc_text = (row.get("text") or row.get("caption") or row.get("description") or "").strip()
+                        if not doc_text:
+                            doc_text = (row.get("answer") or row.get("page") or "[No text content]").strip()
+                        corpus[doc_id] = doc_text
+            except Exception as e:
+                print(f"Error loading documents for dataset '{dataset}' split '{split}': {e}")
     return corpus
 
 def main():
@@ -63,9 +80,8 @@ def main():
         print(f"Dry run: limited targets to {len(targets)} samples.")
     
     # Find all unique splits to load corpus documents
-    splits = list(set(t["split"] for t in targets))
-    print(f"Loading document corpora for splits: {splits}")
-    corpus = load_all_documents("mm-bright/MM-BRIGHT", splits)
+    print("Loading document corpora from targets...")
+    corpus = load_all_documents(targets)
     print(f"Total corpus documents loaded: {len(corpus)}")
     
     # Freeze model completely (backbone and lm_head)

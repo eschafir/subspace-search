@@ -374,6 +374,7 @@ def main():
             target_entry = {
                 "query_id": q_id,
                 "split": split_name,
+                "dataset": args.dataset,
                 "query_text": query_text,
                 "compensatory_query": comp_query,
                 "ground_truth_ids": ground_truth_ids,
