@@ -221,6 +221,36 @@ def main():
                     query_text = row.get("query", "")
                     queries[q_id] = {"_id": q_id, "text": query_text}
                     qrels[q_id] = row.get("gold_ids", [])
+            elif args.dataset.startswith("beir/") or "beir" in args.dataset.lower():
+                # BEIR dataset loader (e.g., beir/fiqa, beir/dbpedia-entity)
+                print(f"Loading BEIR dataset '{args.dataset}' components...")
+                try:
+                    corpus_ds = load_dataset(args.dataset, "corpus", split="corpus")
+                    queries_ds = load_dataset(args.dataset, "queries", split="queries")
+                    qrels_ds = load_dataset(args.dataset, default=None, split=split_name)
+                except Exception as e:
+                    print(f"Error loading BEIR dataset '{args.dataset}': {e}")
+                    continue
+                
+                print(f"Successfully loaded BEIR components: {len(corpus_ds)} docs, {len(queries_ds)} queries, {len(qrels_ds)} qrels.")
+                
+                # Map corpus
+                for row in corpus_ds:
+                    doc_id = row["_id"]
+                    corpus[doc_id] = {"_id": doc_id, "title": row.get("title", ""), "text": row.get("text", "")}
+                    
+                # Map queries
+                for row in queries_ds:
+                    q_id = row["_id"]
+                    queries[q_id] = {"_id": q_id, "text": row.get("text", "")}
+                    
+                # Map relevance
+                for row in qrels_ds:
+                    q_id = row["query-id"]
+                    doc_id = row["corpus-id"]
+                    score = int(row.get("score", 1))
+                    if score >= 1:
+                        qrels.setdefault(q_id, []).append(doc_id)
             else:
                 # Generic loader for ViDoRe or other HF datasets
                 print(f"Loading HF dataset split: '{split_name}'...")
@@ -249,7 +279,13 @@ def main():
                     if not doc_text:
                         doc_text = (row.get("answer") or row.get("page") or "[No text content]").strip()
                         
-                    corpus[doc_id] = {"_id": doc_id, "title": doc_title, "text": doc_text}
+                    # Handle page text deduplication across duplicate keys
+                    if doc_id in corpus:
+                        existing = corpus[doc_id]["text"]
+                        if doc_text and doc_text not in existing:
+                            corpus[doc_id]["text"] = existing + "\n" + doc_text
+                    else:
+                        corpus[doc_id] = {"_id": doc_id, "title": doc_title, "text": doc_text}
                     qrels.setdefault(q_id, []).append(doc_id)
         else:
             # Load local NFCorpus
