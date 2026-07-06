@@ -126,6 +126,8 @@ def main():
             
             # 1. Prepare Document Batch inputs
             doc_texts = [corpus.get(d_id, "[Document Content Missing]") for d_id in candidate_ids]
+            # Ensure text is not empty or whitespace only to prevent zero-token model shape errors
+            doc_texts = [t if (t and t.strip()) else "[Empty Document Content]" for t in doc_texts]
             
             # Sub-batch documents to prevent CUDA Out-of-Memory (OOM) spikes
             doc_sub_batch_size = 4
