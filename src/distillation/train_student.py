@@ -130,6 +130,7 @@ def main():
             # Sub-batch documents to prevent CUDA Out-of-Memory (OOM) spikes
             doc_sub_batch_size = 4
             w_p_parts = []
+            z_p_all_parts = []
             
             for b_idx in range(0, len(doc_texts), doc_sub_batch_size):
                 sub_doc_texts = doc_texts[b_idx : b_idx + doc_sub_batch_size]
@@ -165,10 +166,12 @@ def main():
                         z_p_parts.append(z_p_chunk)
                         
                     z_p = torch.cat(z_p_parts, dim=1) # (batch_size, vocab_size)
+                    z_p_all_parts.append(z_p)
                     sub_w_p = torch.log1p(torch.relu(z_p)) # (batch_size, vocab_size)
                     w_p_parts.append(sub_w_p)
                     
             w_p = torch.cat(w_p_parts, dim=0) # (candidate_pool_size, vocab_size)
+            z_p = torch.cat(z_p_all_parts, dim=0) # (candidate_pool_size, vocab_size)
             batch_size = w_p.shape[0]
             
             # 3. Process Query inputs and representations
