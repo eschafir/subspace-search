@@ -37,6 +37,15 @@ def load_all_documents(targets):
                         if not doc_text:
                             doc_text = "[No text extraction available]"
                         corpus[doc_id] = doc_text
+                elif dataset.startswith("beir/") or "beir" in dataset.lower():
+                    # Load BEIR corpus configuration directly
+                    print(f"Detected BEIR dataset configuration for '{dataset}' corpus...")
+                    ds = load_dataset(dataset, "corpus", split="corpus")
+                    for row in ds:
+                        raw_doc_id = row["_id"]
+                        # Match the exact namespaced document IDs used in generate_teacher_data.py
+                        doc_id = f"{dataset.replace('/', '_')}_{raw_doc_id}"
+                        corpus[doc_id] = row.get("text", "")
                 else:
                     ds = load_dataset(dataset, split=split)
                     for idx, row in enumerate(ds):
