@@ -127,39 +127,49 @@ def main():
             # 1. Prepare Document Batch inputs
             doc_texts = [corpus.get(d_id, "[Document Content Missing]") for d_id in candidate_ids]
             
-            # Tokenize documents
-            doc_inputs = tokenizer(
-                doc_texts,
-                return_tensors="pt",
-                padding=True,
-                truncation=True,
-                max_length=512
-            ).to(device)
+            # Sub-batch documents to prevent CUDA Out-of-Memory (OOM) spikes
+            doc_sub_batch_size = 4
+            w_p_parts = []
             
-            # 2. Forward pass through frozen model
-            with torch.no_grad():
-                outputs = model.model(
-                    input_ids=doc_inputs["input_ids"],
-                    attention_mask=doc_inputs["attention_mask"],
-                    output_hidden_states=True
-                )
-                hidden_states = outputs.hidden_states[-1] # (batch_size, seq_len, hidden_dim)
+            for b_idx in range(0, len(doc_texts), doc_sub_batch_size):
+                sub_doc_texts = doc_texts[b_idx : b_idx + doc_sub_batch_size]
                 
-                batch_size = hidden_states.shape[0]
-                attention_mask = doc_inputs["attention_mask"].unsqueeze(-1) # (batch_size, seq_len, 1)
+                # Tokenize documents
+                doc_inputs = tokenizer(
+                    sub_doc_texts,
+                    return_tensors="pt",
+                    padding=True,
+                    truncation=True,
+                    max_length=512
+                ).to(device)
                 
-                # Compute logits in chunks
-                chunk_size = 20000
-                z_p_parts = []
-                for i in range(0, vocab_size, chunk_size):
-                    weight_chunk = model.lm_head.weight[i:i+chunk_size]
-                    logits_chunk = torch.matmul(hidden_states, weight_chunk.t())
-                    logits_chunk = logits_chunk * attention_mask + (1 - attention_mask) * -1e9
-                    z_p_chunk, _ = torch.max(logits_chunk, dim=1)
-                    z_p_parts.append(z_p_chunk)
+                # 2. Forward pass through frozen model
+                with torch.no_grad():
+                    outputs = model.model(
+                        input_ids=doc_inputs["input_ids"],
+                        attention_mask=doc_inputs["attention_mask"],
+                        output_hidden_states=True
+                    )
+                    hidden_states = outputs.hidden_states[-1] # (batch_size, seq_len, hidden_dim)
                     
-                z_p = torch.cat(z_p_parts, dim=1) # (batch_size, vocab_size)
-                w_p = torch.log1p(torch.relu(z_p)) # (batch_size, vocab_size)
+                    attention_mask = doc_inputs["attention_mask"].unsqueeze(-1) # (batch_size, seq_len, 1)
+                    
+                    # Compute logits in chunks
+                    chunk_size = 20000
+                    z_p_parts = []
+                    for i in range(0, vocab_size, chunk_size):
+                        weight_chunk = model.lm_head.weight[i:i+chunk_size]
+                        logits_chunk = torch.matmul(hidden_states, weight_chunk.t())
+                        logits_chunk = logits_chunk * attention_mask + (1 - attention_mask) * -1e9
+                        z_p_chunk, _ = torch.max(logits_chunk, dim=1)
+                        z_p_parts.append(z_p_chunk)
+                        
+                    z_p = torch.cat(z_p_parts, dim=1) # (batch_size, vocab_size)
+                    sub_w_p = torch.log1p(torch.relu(z_p)) # (batch_size, vocab_size)
+                    w_p_parts.append(sub_w_p)
+                    
+            w_p = torch.cat(w_p_parts, dim=0) # (candidate_pool_size, vocab_size)
+            batch_size = w_p.shape[0]
             
             # 3. Process Query inputs and representations
             query_token_ids = tokenizer(q_text, add_special_tokens=False)["input_ids"]
