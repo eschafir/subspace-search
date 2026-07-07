@@ -9,7 +9,7 @@ import faiss
 import numpy as np
 from tqdm import tqdm
 from datasets import load_dataset
-from transformers import CLIPProcessor, CLIPModel
+from transformers import AutoTokenizer, AutoModel
 
 # Add project root parent to sys.path to find src
 project_root = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -49,11 +49,11 @@ def min_max_normalize(scores):
         return (scores - s_min) / (s_max - s_min)
     return torch.zeros_like(scores)
 
-def evaluate_split_hybrid(model, tokenizer, query_lut, clip_model, clip_processor, device, 
-                          dataset_name, split_name, batch_size=32, clip_batch_size=256, 
+def evaluate_split_hybrid(model, tokenizer, query_lut, dense_model, dense_processor, is_clip, device, 
+                          dataset_name, split_name, batch_size=32, dense_batch_size=256, 
                           logit_threshold=0.0, filter_stopwords=False, beta=0.4):
-    """Evaluate hybrid V-SPLADE student + CLIP text retrieval on a single split."""
-    print(f"\nEvaluating split: '{split_name}' with beta = {beta}...")
+    """Evaluate hybrid V-SPLADE student + dense (CLIP / Sentence-Transformers) retrieval on a single split."""
+    print(f"\nEvaluating split: '{split_name}' with beta = {beta} (is_clip = {is_clip})...")
     
     # Load dataset split docs & examples
     try:
@@ -67,16 +67,16 @@ def evaluate_split_hybrid(model, tokenizer, query_lut, clip_model, clip_processo
     
     corpus_ids = []
     w_p_list = []
-    clip_embeds_list = []
+    dense_embeds_list = []
     
     model.eval()
-    clip_model.eval()
+    dense_model.eval()
     vocab_size = model.config.vocab_size
     
-    print("Encoding corpus documents (V-SPLADE and CLIP)...")
+    print("Encoding corpus documents (V-SPLADE and Dense)...")
     with torch.no_grad():
-        for i in tqdm(range(0, len(docs_ds), clip_batch_size), desc="Doc Batches"):
-            batch = docs_ds[i : i + clip_batch_size]
+        for i in tqdm(range(0, len(docs_ds), dense_batch_size), desc="Doc Batches"):
+            batch = docs_ds[i : i + dense_batch_size]
             doc_texts = batch.get("content", batch.get("text", []))
             doc_texts = [text if text is not None else "[No text]" for text in doc_texts]
             
@@ -119,34 +119,54 @@ def evaluate_split_hybrid(model, tokenizer, query_lut, clip_model, clip_processo
                 w_p = torch.log1p(torch.relu(z_p))
                 w_p_list.append(w_p.cpu())
                 
-            # --- 2. CLIP encoding ---
-            clip_inputs = clip_processor(
-                text=doc_texts,
-                return_tensors="pt",
-                padding=True,
-                truncation=True,
-                max_length=77
-            ).to(device)
-            doc_features = clip_model.get_text_features(**clip_inputs)
-            if hasattr(doc_features, "text_embeds"):
-                doc_features = doc_features.text_embeds
-            elif hasattr(doc_features, "pooler_output"):
-                doc_features = doc_features.pooler_output
-            elif not isinstance(doc_features, torch.Tensor) and hasattr(doc_features, "last_hidden_state"):
-                doc_features = doc_features.last_hidden_state
+            # --- 2. Dense encoding ---
+            if is_clip:
+                clip_inputs = dense_processor(
+                    text=doc_texts,
+                    return_tensors="pt",
+                    padding=True,
+                    truncation=True,
+                    max_length=77
+                ).to(device)
+                doc_features = dense_model.get_text_features(**clip_inputs)
+                if hasattr(doc_features, "text_embeds"):
+                    doc_features = doc_features.text_embeds
+                elif hasattr(doc_features, "pooler_output"):
+                    doc_features = doc_features.pooler_output
+                elif not isinstance(doc_features, torch.Tensor) and hasattr(doc_features, "last_hidden_state"):
+                    doc_features = doc_features.last_hidden_state
+                    
+                doc_features = doc_features / doc_features.norm(p=2, dim=-1, keepdim=True)
+            else:
+                # Sentence-Transformers path via AutoModel (mean pooling)
+                inputs = dense_processor(
+                    doc_texts,
+                    return_tensors="pt",
+                    padding=True,
+                    truncation=True,
+                    max_length=512
+                ).to(device)
+                outputs = dense_model(**inputs)
                 
-            doc_features = doc_features / doc_features.norm(p=2, dim=-1, keepdim=True) # L2 normalize
-            clip_embeds_list.append(doc_features.cpu().numpy().astype('float32'))
+                token_embeddings = outputs[0]
+                attention_mask = inputs['attention_mask'].unsqueeze(-1)
+                input_mask_expanded = attention_mask.expand(token_embeddings.size()).float()
+                sum_embeddings = torch.sum(token_embeddings * input_mask_expanded, 1)
+                sum_mask = torch.clamp(input_mask_expanded.sum(1), min=1e-9)
+                doc_features = sum_embeddings / sum_mask
+                doc_features = F.normalize(doc_features, p=2, dim=1)
+                
+            dense_embeds_list.append(doc_features.cpu().numpy().astype('float32'))
             
     # Concatenate representations
     w_p_all = torch.cat(w_p_list, dim=0) # (num_docs, vocab_size)
-    clip_embeds_all = np.vstack(clip_embeds_list) # (num_docs, clip_dim)
+    dense_embeds_all = np.vstack(dense_embeds_list) # (num_docs, dense_dim)
     
     # --- 3. Build FAISS Index ---
     print("Building FAISS index for dense representations...")
-    dimension = clip_embeds_all.shape[1]
+    dimension = dense_embeds_all.shape[1]
     faiss_index = faiss.IndexFlatIP(dimension) # Flat Inner-Product index for cosine similarity
-    faiss_index.add(clip_embeds_all)
+    faiss_index.add(dense_embeds_all)
     print("FAISS index built successfully.")
     
     # Evaluate queries
@@ -179,24 +199,43 @@ def evaluate_split_hybrid(model, tokenizer, query_lut, clip_model, clip_processo
             w_q[query_token_ids] = w_q_weights
         scores_sparse = torch.sum(w_q.unsqueeze(0) * w_p_all, dim=1).to(device) # (num_docs,)
         
-        # --- 2. Compute CLIP Dense Scores via FAISS ---
+        # --- 2. Compute Dense Scores via FAISS ---
         with torch.no_grad():
-            q_inputs = clip_processor(
-                text=[q_text],
-                return_tensors="pt",
-                padding=True,
-                truncation=True,
-                max_length=77
-            ).to(device)
-            q_features = clip_model.get_text_features(**q_inputs)
-            if hasattr(q_features, "text_embeds"):
-                q_features = q_features.text_embeds
-            elif hasattr(q_features, "pooler_output"):
-                q_features = q_features.pooler_output
-            elif not isinstance(q_features, torch.Tensor) and hasattr(q_features, "last_hidden_state"):
-                q_features = q_features.last_hidden_state
+            if is_clip:
+                q_inputs = dense_processor(
+                    text=[q_text],
+                    return_tensors="pt",
+                    padding=True,
+                    truncation=True,
+                    max_length=77
+                ).to(device)
+                q_features = dense_model.get_text_features(**q_inputs)
+                if hasattr(q_features, "text_embeds"):
+                    q_features = q_features.text_embeds
+                elif hasattr(q_features, "pooler_output"):
+                    q_features = q_features.pooler_output
+                elif not isinstance(q_features, torch.Tensor) and hasattr(q_features, "last_hidden_state"):
+                    q_features = q_features.last_hidden_state
+                    
+                q_features = q_features / q_features.norm(p=2, dim=-1, keepdim=True)
+            else:
+                q_inputs = dense_processor(
+                    [q_text],
+                    return_tensors="pt",
+                    padding=True,
+                    truncation=True,
+                    max_length=512
+                ).to(device)
+                q_outputs = dense_model(**q_inputs)
                 
-            q_features = q_features / q_features.norm(p=2, dim=-1, keepdim=True)
+                token_embeddings = q_outputs[0]
+                attention_mask = q_inputs['attention_mask'].unsqueeze(-1)
+                input_mask_expanded = attention_mask.expand(token_embeddings.size()).float()
+                sum_embeddings = torch.sum(token_embeddings * input_mask_expanded, 1)
+                sum_mask = torch.clamp(input_mask_expanded.sum(1), min=1e-9)
+                q_features = sum_embeddings / sum_mask
+                q_features = F.normalize(q_features, p=2, dim=1)
+                
             q_embed_np = q_features.cpu().numpy().astype('float32')
             
         # Search FAISS index to retrieve inner product scores for all docs
@@ -247,14 +286,14 @@ def evaluate_split_hybrid(model, tokenizer, query_lut, clip_model, clip_processo
     return mrr, ndcg
 
 def main():
-    parser = argparse.ArgumentParser(description="HIVE-to-V-SPLADE Hybrid Evaluation: Student (LUT-Only) + CLIP + FAISS")
+    parser = argparse.ArgumentParser(description="HIVE-to-V-SPLADE Hybrid Evaluation: Student (LUT-Only) + Dense Model + FAISS")
     parser.add_argument("--checkpoint-path", type=str, default="results/vsplade_student_checkpoint.pt", help="Path to distilled student weights")
     parser.add_argument("--model", type=str, default="qwen-1.5b", help="Model key of the student backbone")
-    parser.add_argument("--clip-model", type=str, default="openai/clip-vit-base-patch32", help="Pretrained CLIP model key")
+    parser.add_argument("--dense-model", type=str, default="openai/clip-vit-base-patch32", help="Pretrained dense model key (e.g. openai/clip-vit-base-patch32 or sentence-transformers/all-MiniLM-L6-v2)")
     parser.add_argument("--dataset", type=str, default="mm-bright/MM-BRIGHT", help="Dataset name on Hugging Face")
     parser.add_argument("--test-splits", type=str, default="academia,biology,physics,philosophy,psychology,quant,quantumcomputing,robotics,law", help="Comma-separated list of held-out splits to evaluate")
     parser.add_argument("--batch-size", type=int, default=32, help="Batch size for V-SPLADE document encoding")
-    parser.add_argument("--clip-batch-size", type=int, default=256, help="Batch size for CLIP document encoding")
+    parser.add_argument("--dense-batch-size", type=int, default=256, help="Batch size for Dense model document encoding")
     parser.add_argument("--logit-threshold", type=float, default=0.0, help="Logit threshold to enforce sparsity")
     parser.add_argument("--filter-stopwords", action="store_true", help="Clean queries at string level by removing stop-words before BPE tokenization")
     parser.add_argument("--beta", type=float, default=0.4, help="Weight balance for dense channel scores (score_hybrid = (1-beta)*sparse + beta*dense)")
@@ -272,10 +311,18 @@ def main():
     checkpoint = torch.load(args.checkpoint_path, map_location=device)
     query_lut = checkpoint["query_lut"].to(device)
     
-    # 2. Load CLIP Model
-    print(f"Loading CLIP model '{args.clip_model}' on {device}...")
-    clip_model = CLIPModel.from_pretrained(args.clip_model).to(device)
-    clip_processor = CLIPProcessor.from_pretrained(args.clip_model)
+    # 2. Load Dense Model
+    dense_model_name = args.dense_model
+    is_clip = "clip" in dense_model_name.lower()
+    print(f"Loading dense model '{dense_model_name}' on {device} (is_clip = {is_clip})...")
+    
+    if is_clip:
+        from transformers import CLIPProcessor, CLIPModel
+        dense_model = CLIPModel.from_pretrained(dense_model_name).to(device)
+        dense_processor = CLIPProcessor.from_pretrained(dense_model_name)
+    else:
+        dense_model = AutoModel.from_pretrained(dense_model_name).to(device)
+        dense_processor = AutoTokenizer.from_pretrained(dense_model_name)
     print("Models loaded successfully.")
     
     # Parse test splits
@@ -289,8 +336,8 @@ def main():
     
     for split in test_splits:
         res = evaluate_split_hybrid(
-            model, tokenizer, query_lut, clip_model, clip_processor, device, 
-            args.dataset, split, batch_size=args.batch_size, clip_batch_size=args.clip_batch_size, 
+            model, tokenizer, query_lut, dense_model, dense_processor, is_clip, device, 
+            args.dataset, split, batch_size=args.batch_size, dense_batch_size=args.dense_batch_size, 
             logit_threshold=args.logit_threshold, filter_stopwords=args.filter_stopwords, beta=args.beta
         )
         if res:
@@ -314,6 +361,7 @@ def main():
         output_results_path = "results/hybrid_evaluation_results.json"
         with open(output_results_path, "w") as f:
             json.dump({
+                "dense_model": dense_model_name,
                 "individual_splits": all_results,
                 "average": {"MRR@10": mrr_sum/evaluated_count, "NDCG@10": ndcg_sum/evaluated_count}
             }, f, indent=2)
