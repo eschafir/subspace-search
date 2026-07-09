@@ -21,10 +21,10 @@ from src.distillation.evaluate_hybrid import clean_query_text, min_max_normalize
 def evaluate_split_hybrid_reranker(model, tokenizer, query_lut, dense_model, dense_processor, is_clip,
                                    reranker_model, reranker_tokenizer, device, dataset_name, split_name,
                                    batch_size=32, dense_batch_size=256, logit_threshold=0.0,
-                                   filter_stopwords=False, beta=0.6, rerank_top_k=30):
+                                   filter_stopwords=False, beta=0.6, rerank_top_k=30, gamma=0.3):
     """Evaluate V-SPLADE student + Dense + FAISS retrieval followed by Cross-Encoder reranking on a single split."""
     print(f"\nEvaluating split '{split_name}' with Reranker...")
-    print(f"Params: beta={beta}, rerank_top_k={rerank_top_k}")
+    print(f"Params: beta={beta}, rerank_top_k={rerank_top_k}, gamma={gamma}")
     
     # Load dataset split docs & examples
     try:
@@ -144,6 +144,9 @@ def evaluate_split_hybrid_reranker(model, tokenizer, query_lut, dense_model, den
     faiss_index.add(dense_embeds_all)
     print("FAISS index built successfully.")
     
+    # Precompute doc ID mapping for fast O(1) lookups
+    doc_id_to_idx = {d_id: idx for idx, d_id in enumerate(corpus_ids)}
+
     # Evaluate queries
     mrr_total = 0.0
     ndcg_total = 0.0
@@ -247,10 +250,22 @@ def evaluate_split_hybrid_reranker(model, tokenizer, query_lut, dense_model, den
         with torch.no_grad():
             rerank_outputs = reranker_model(**rerank_inputs)
             # Cross-encoder logits represent similarity scores
-            rerank_scores = rerank_outputs.logits.view(-1).tolist()
+            rerank_scores = rerank_outputs.logits.view(-1)
             
-        # Re-sort candidates based on cross-encoder logits
-        scored_candidates = list(zip(candidates_to_rerank, rerank_scores))
+        # Min-max normalize Cross-Encoder scores
+        norm_rerank_scores = min_max_normalize(rerank_scores).tolist()
+        
+        # Fuse with V-SPLADE sparse score
+        fused_rerank_scores = []
+        for i, d_id in enumerate(candidates_to_rerank):
+            doc_idx = doc_id_to_idx[d_id]
+            v_score = norm_sparse[doc_idx].item()
+            ce_score = norm_rerank_scores[i]
+            fused_score = (1.0 - gamma) * ce_score + gamma * v_score
+            fused_rerank_scores.append(fused_score)
+            
+        # Re-sort candidates based on fused scores
+        scored_candidates = list(zip(candidates_to_rerank, fused_rerank_scores))
         scored_candidates.sort(key=lambda x: x[1], reverse=True)
         reranked_top_ids = [item[0] for item in scored_candidates]
         
@@ -301,6 +316,7 @@ def main():
     parser.add_argument("--filter-stopwords", action="store_true", help="Clean queries before tokenization")
     parser.add_argument("--beta", type=float, default=0.6, help="Optimal score-fusion weight found in sweep")
     parser.add_argument("--rerank-top-k", type=int, default=30, help="Number of retrieved candidates to pass to cross-encoder")
+    parser.add_argument("--gamma", type=float, default=0.3, help="Score fusion weight for reranker stage (gamma * V-SPLADE + (1-gamma) * Cross-Encoder)")
     args = parser.parse_args()
     
     device = best_gpu()
@@ -347,7 +363,7 @@ def main():
             reranker_model, reranker_tokenizer, device, args.dataset, split,
             batch_size=args.batch_size, dense_batch_size=args.dense_batch_size,
             logit_threshold=args.logit_threshold, filter_stopwords=args.filter_stopwords,
-            beta=args.beta, rerank_top_k=args.rerank_top_k
+            beta=args.beta, rerank_top_k=args.rerank_top_k, gamma=args.gamma
         )
         if res:
             mrr, ndcg = res
