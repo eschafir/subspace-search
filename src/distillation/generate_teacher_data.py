@@ -399,11 +399,17 @@ def main():
                 doc = corpus[doc_id]
                 is_ground_truth = "Yes" if doc_id in ground_truth_ids else "No"
                 
+                # Truncate doc content to 4000 characters to prevent OOM on single GPU 32B model,
+                # while preserving complete context for standard MM-BRIGHT pages.
+                truncated_text = clean_html(doc['text'])[:4000]
+                if len(doc['text']) > 4000:
+                    truncated_text += "... [Content Truncated]"
+                
                 stage4_prompt = (
                     f"Original User Query: \"{clean_html(query_text)}\"\n\n"
                     f"Candidate Document (ID: {doc_id}):\n"
                     f"Title: {doc['title']}\n"
-                    f"Content: {clean_html(doc['text'])}\n\n"
+                    f"Content: {truncated_text}\n\n"
                     f"Analyze if this document is logically relevant to answering the original user query. "
                     f"Explain your step-by-step reasoning (the rationale) in 2-3 concise sentences. "
                     f"Then, assign a relevance score between 0.0 (completely irrelevant) and 5.0 (perfect answer). "
@@ -418,6 +424,10 @@ def main():
                 rationales[doc_id] = rationale
                 scores[doc_id] = score
                 print(f"    Assigned Score: {score}")
+                
+                # Free memory after large forward pass
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
                 
             # Compile distillation targets
             target_entry = {
