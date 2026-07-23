@@ -170,10 +170,11 @@ def evaluate_split_hybrid(model, tokenizer, query_lut, dense_model, dense_proces
     # --- 3. Build Dense Index / Representations ---
     if dense_mode == "late-interaction":
         print("Preparing late-interaction corpus representations...")
-        corpus_embeds = torch.nn.utils.rnn.pad_sequence(dense_embeds_list, batch_first=True, padding_value=0.0).to(device)
+        # Keep corpus representations on CPU to prevent CUDA OOMs
+        corpus_embeds = torch.nn.utils.rnn.pad_sequence(dense_embeds_list, batch_first=True, padding_value=0.0) # (num_docs, max_len, dense_dim)
         doc_lengths = [t.shape[0] for t in dense_embeds_list]
         max_len = corpus_embeds.shape[1]
-        corpus_masks = torch.zeros(len(dense_embeds_list), max_len, device=device)
+        corpus_masks = torch.zeros(len(dense_embeds_list), max_len) # Keep mask on CPU
         for idx, l in enumerate(doc_lengths):
             corpus_masks[idx, :l] = 1.0
         faiss_index = None
@@ -215,7 +216,7 @@ def evaluate_split_hybrid(model, tokenizer, query_lut, dense_model, dense_proces
             w_q[query_token_ids] = w_q_weights
         scores_sparse = torch.sum(w_q.unsqueeze(0) * w_p_all, dim=1).to(device) # (num_docs,)
         
-        # --- 2. Compute Dense Scores via FAISS ---
+        # --- 2. Compute Dense Scores via FAISS or Batched Late-Interaction ---
         with torch.no_grad():
             if is_clip:
                 q_inputs = dense_processor(
@@ -248,7 +249,7 @@ def evaluate_split_hybrid(model, tokenizer, query_lut, dense_model, dense_proces
                 if dense_mode == "late-interaction":
                     q_norm_tokens = F.normalize(token_embeddings, p=2, dim=-1)
                     q_mask = q_inputs['attention_mask'][0] == 1
-                    q_embeds = q_norm_tokens[0][q_mask] # shape: [L_q, D]
+                    q_embeds = q_norm_tokens[0][q_mask] # shape: [L_q, D] (device: GPU)
                 else:
                     attention_mask = q_inputs['attention_mask'].unsqueeze(-1)
                     input_mask_expanded = attention_mask.expand(token_embeddings.size()).float()
@@ -260,10 +261,20 @@ def evaluate_split_hybrid(model, tokenizer, query_lut, dense_model, dense_proces
             
         # Search FAISS index or compute late-interaction scores
         if dense_mode == "late-interaction":
-            sim = torch.einsum("qd,nld->nql", q_embeds, corpus_embeds)
-            sim = sim * corpus_masks.unsqueeze(1) + (1.0 - corpus_masks.unsqueeze(1)) * -1e9
-            max_sim = torch.max(sim, dim=-1)[0]
-            scores_dense = torch.sum(max_sim, dim=-1)
+            scores_dense_list = []
+            eval_batch_size = 512 # Compute MaxSim in small batches to preserve VRAM
+            for b_start in range(0, len(corpus_embeds), eval_batch_size):
+                b_end = min(b_start + eval_batch_size, len(corpus_embeds))
+                c_embeds_batch = corpus_embeds[b_start:b_end].to(device) # Send mini-batch of docs to GPU
+                c_masks_batch = corpus_masks[b_start:b_end].to(device)
+                
+                sim = torch.einsum("qd,nld->nql", q_embeds, c_embeds_batch)
+                sim = sim * c_masks_batch.unsqueeze(1) + (1.0 - c_masks_batch.unsqueeze(1)) * -1e9
+                max_sim = torch.max(sim, dim=-1)[0]
+                scores_dense_batch = torch.sum(max_sim, dim=-1)
+                scores_dense_list.append(scores_dense_batch)
+                
+            scores_dense = torch.cat(scores_dense_list, dim=0)
         else:
             D, I = faiss_index.search(q_embed_np, len(corpus_ids))
             scores_dense = torch.zeros(len(corpus_ids), device=device)
