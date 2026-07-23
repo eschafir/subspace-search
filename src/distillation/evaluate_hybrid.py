@@ -51,7 +51,7 @@ def min_max_normalize(scores):
 
 def evaluate_split_hybrid(model, tokenizer, query_lut, dense_model, dense_processor, is_clip, device, 
                           dataset_name, split_name, batch_size=32, dense_batch_size=256, 
-                          logit_threshold=0.0, filter_stopwords=False, beta=0.4):
+                          logit_threshold=0.0, filter_stopwords=False, beta=0.4, dense_mode="bi-encoder"):
     """Evaluate hybrid V-SPLADE student + dense (CLIP / Sentence-Transformers) retrieval on a single split."""
     print(f"\nEvaluating split: '{split_name}' with beta = {beta} (is_clip = {is_clip})...")
     
@@ -138,7 +138,7 @@ def evaluate_split_hybrid(model, tokenizer, query_lut, dense_model, dense_proces
                     
                 doc_features = doc_features / doc_features.norm(p=2, dim=-1, keepdim=True)
             else:
-                # Sentence-Transformers path via AutoModel (mean pooling)
+                # Sentence-Transformers path via AutoModel (mean pooling or late interaction)
                 inputs = dense_processor(
                     doc_texts,
                     return_tensors="pt",
@@ -149,25 +149,41 @@ def evaluate_split_hybrid(model, tokenizer, query_lut, dense_model, dense_proces
                 outputs = dense_model(**inputs)
                 
                 token_embeddings = outputs[0]
-                attention_mask = inputs['attention_mask'].unsqueeze(-1)
-                input_mask_expanded = attention_mask.expand(token_embeddings.size()).float()
-                sum_embeddings = torch.sum(token_embeddings * input_mask_expanded, 1)
-                sum_mask = torch.clamp(input_mask_expanded.sum(1), min=1e-9)
-                doc_features = sum_embeddings / sum_mask
-                doc_features = F.normalize(doc_features, p=2, dim=1)
-                
-            dense_embeds_list.append(doc_features.cpu().numpy().astype('float32'))
+                if dense_mode == "late-interaction":
+                    norm_tokens = F.normalize(token_embeddings, p=2, dim=-1)
+                    for b_idx in range(len(doc_texts)):
+                        mask = inputs['attention_mask'][b_idx] == 1
+                        valid_tokens = norm_tokens[b_idx][mask]
+                        dense_embeds_list.append(valid_tokens.cpu())
+                else:
+                    attention_mask = inputs['attention_mask'].to(hidden_states.device).unsqueeze(-1)
+                    input_mask_expanded = attention_mask.expand(token_embeddings.size()).float()
+                    sum_embeddings = torch.sum(token_embeddings * input_mask_expanded, 1)
+                    sum_mask = torch.clamp(input_mask_expanded.sum(1), min=1e-9)
+                    doc_features = sum_embeddings / sum_mask
+                    doc_features = F.normalize(doc_features, p=2, dim=1)
+                    dense_embeds_list.append(doc_features.cpu().numpy().astype('float32'))
             
     # Concatenate representations
     w_p_all = torch.cat(w_p_list, dim=0) # (num_docs, vocab_size)
-    dense_embeds_all = np.vstack(dense_embeds_list) # (num_docs, dense_dim)
     
-    # --- 3. Build FAISS Index ---
-    print("Building FAISS index for dense representations...")
-    dimension = dense_embeds_all.shape[1]
-    faiss_index = faiss.IndexFlatIP(dimension) # Flat Inner-Product index for cosine similarity
-    faiss_index.add(dense_embeds_all)
-    print("FAISS index built successfully.")
+    # --- 3. Build Dense Index / Representations ---
+    if dense_mode == "late-interaction":
+        print("Preparing late-interaction corpus representations...")
+        corpus_embeds = torch.nn.utils.rnn.pad_sequence(dense_embeds_list, batch_first=True, padding_value=0.0).to(device)
+        doc_lengths = [t.shape[0] for t in dense_embeds_list]
+        max_len = corpus_embeds.shape[1]
+        corpus_masks = torch.zeros(len(dense_embeds_list), max_len, device=device)
+        for idx, l in enumerate(doc_lengths):
+            corpus_masks[idx, :l] = 1.0
+        faiss_index = None
+    else:
+        dense_embeds_all = np.vstack(dense_embeds_list) # (num_docs, dense_dim)
+        print("Building FAISS index for dense representations...")
+        dimension = dense_embeds_all.shape[1]
+        faiss_index = faiss.IndexFlatIP(dimension) # Flat Inner-Product index for cosine similarity
+        faiss_index.add(dense_embeds_all)
+        print("FAISS index built successfully.")
     
     # Evaluate queries
     mrr_total = 0.0
@@ -229,21 +245,30 @@ def evaluate_split_hybrid(model, tokenizer, query_lut, dense_model, dense_proces
                 q_outputs = dense_model(**q_inputs)
                 
                 token_embeddings = q_outputs[0]
-                attention_mask = q_inputs['attention_mask'].unsqueeze(-1)
-                input_mask_expanded = attention_mask.expand(token_embeddings.size()).float()
-                sum_embeddings = torch.sum(token_embeddings * input_mask_expanded, 1)
-                sum_mask = torch.clamp(input_mask_expanded.sum(1), min=1e-9)
-                q_features = sum_embeddings / sum_mask
-                q_features = F.normalize(q_features, p=2, dim=1)
-                
-            q_embed_np = q_features.cpu().numpy().astype('float32')
+                if dense_mode == "late-interaction":
+                    q_norm_tokens = F.normalize(token_embeddings, p=2, dim=-1)
+                    q_mask = q_inputs['attention_mask'][0] == 1
+                    q_embeds = q_norm_tokens[0][q_mask] # shape: [L_q, D]
+                else:
+                    attention_mask = q_inputs['attention_mask'].unsqueeze(-1)
+                    input_mask_expanded = attention_mask.expand(token_embeddings.size()).float()
+                    sum_embeddings = torch.sum(token_embeddings * input_mask_expanded, 1)
+                    sum_mask = torch.clamp(input_mask_expanded.sum(1), min=1e-9)
+                    q_features = sum_embeddings / sum_mask
+                    q_features = F.normalize(q_features, p=2, dim=1)
+                    q_embed_np = q_features.cpu().numpy().astype('float32')
             
-        # Search FAISS index to retrieve inner product scores for all docs
-        D, I = faiss_index.search(q_embed_np, len(corpus_ids))
-        
-        scores_dense = torch.zeros(len(corpus_ids), device=device)
-        for rank_idx, doc_idx in enumerate(I[0]):
-            scores_dense[doc_idx] = float(D[0][rank_idx])
+        # Search FAISS index or compute late-interaction scores
+        if dense_mode == "late-interaction":
+            sim = torch.einsum("qd,nld->nql", q_embeds, corpus_embeds)
+            sim = sim * corpus_masks.unsqueeze(1) + (1.0 - corpus_masks.unsqueeze(1)) * -1e9
+            max_sim = torch.max(sim, dim=-1)[0]
+            scores_dense = torch.sum(max_sim, dim=-1)
+        else:
+            D, I = faiss_index.search(q_embed_np, len(corpus_ids))
+            scores_dense = torch.zeros(len(corpus_ids), device=device)
+            for rank_idx, doc_idx in enumerate(I[0]):
+                scores_dense[doc_idx] = float(D[0][rank_idx])
             
         # --- 3. Score Fusion ---
         norm_sparse = min_max_normalize(scores_sparse)
@@ -290,6 +315,7 @@ def main():
     parser.add_argument("--checkpoint-path", type=str, default="results/vsplade_student_checkpoint.pt", help="Path to distilled student weights")
     parser.add_argument("--model", type=str, default="qwen-1.5b", help="Model key of the student backbone")
     parser.add_argument("--dense-model", type=str, default="openai/clip-vit-base-patch32", help="Pretrained dense model key (e.g. openai/clip-vit-base-patch32 or sentence-transformers/all-MiniLM-L6-v2)")
+    parser.add_argument("--dense-mode", type=str, default="bi-encoder", choices=["bi-encoder", "late-interaction"], help="Embedding matching architecture mode")
     parser.add_argument("--dataset", type=str, default="mm-bright/MM-BRIGHT", help="Dataset name on Hugging Face")
     parser.add_argument("--test-splits", type=str, default="academia,biology,physics,philosophy,psychology,quant,quantumcomputing,robotics,law", help="Comma-separated list of held-out splits to evaluate")
     parser.add_argument("--batch-size", type=int, default=32, help="Batch size for V-SPLADE document encoding")
@@ -340,7 +366,8 @@ def main():
         res = evaluate_split_hybrid(
             model, tokenizer, query_lut, dense_model, dense_processor, is_clip, device, 
             args.dataset, split, batch_size=args.batch_size, dense_batch_size=args.dense_batch_size, 
-            logit_threshold=args.logit_threshold, filter_stopwords=args.filter_stopwords, beta=args.beta
+            logit_threshold=args.logit_threshold, filter_stopwords=args.filter_stopwords, beta=args.beta,
+            dense_mode=args.dense_mode
         )
         if res:
             mrr, ndcg = res
