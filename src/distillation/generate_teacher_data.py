@@ -144,6 +144,8 @@ def main():
         device = best_gpu()
         print(f"Loading teacher model {args.model} on {device}...")
         model, tokenizer = load(args.model, device=device)
+        if hasattr(model, "device"):
+            device = model.device
     
     # Load existing targets if file exists to enable resuming
     targets = []

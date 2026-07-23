@@ -103,11 +103,11 @@ def evaluate_split_hybrid(model, tokenizer, query_lut, dense_model, dense_proces
                 )
                 hidden_states = outputs.hidden_states[-1]
                 
-                attention_mask = doc_inputs["attention_mask"].unsqueeze(-1)
+                attention_mask = doc_inputs["attention_mask"].to(hidden_states.device).unsqueeze(-1)
                 chunk_size = 20000
                 z_p_parts = []
                 for start in range(0, vocab_size, chunk_size):
-                    weight_chunk = model.lm_head.weight[start : start + chunk_size]
+                    weight_chunk = model.lm_head.weight[start : start + chunk_size].to(hidden_states.device)
                     logits_chunk = torch.matmul(hidden_states, weight_chunk.t())
                     logits_chunk = logits_chunk * attention_mask + (1 - attention_mask) * -1e9
                     z_p_chunk, _ = torch.max(logits_chunk, dim=1)
@@ -304,6 +304,8 @@ def main():
     # 1. Load V-SPLADE Student
     print(f"Loading base student model '{args.model}' on {device}...")
     model, tokenizer = load(args.model, device=device)
+    if hasattr(model, "device"):
+        device = model.device
     if not os.path.exists(args.checkpoint_path):
         print(f"Error: Checkpoint file not found at {args.checkpoint_path}.")
         return

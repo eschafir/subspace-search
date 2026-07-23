@@ -74,6 +74,8 @@ def main():
     device = best_gpu()
     print(f"Loading student base model '{args.model}' on {device}...")
     model, tokenizer = load(args.model, device=device)
+    if hasattr(model, "device"):
+        device = model.device
     
     # Load targets dataset
     if not os.path.exists(args.targets_path):

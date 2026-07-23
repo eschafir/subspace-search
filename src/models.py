@@ -40,8 +40,15 @@ def load(name: str, device: str = "cuda", dtype=torch.bfloat16):
     tokenizer = AutoTokenizer.from_pretrained(model_id, padding_side="left")
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
+        
+    # For large models, distribute across available GPUs to prevent OOMs
+    if "32b" in name.lower() or "72b" in name.lower():
+        device_map = "auto"
+    else:
+        device_map = device
+        
     model = AutoModelForCausalLM.from_pretrained(
-        model_id, torch_dtype=dtype, device_map=device
+        model_id, torch_dtype=dtype, device_map=device_map
     )
     model.eval()
     return model, tokenizer
