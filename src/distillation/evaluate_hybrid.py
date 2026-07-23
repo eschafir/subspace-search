@@ -70,7 +70,8 @@ def load_colbert_projection(model_name, device):
 
 def evaluate_split_hybrid(model, tokenizer, query_lut, dense_model, dense_processor, is_clip, device, 
                           dataset_name, split_name, batch_size=32, dense_batch_size=256, 
-                          logit_threshold=0.0, filter_stopwords=False, beta=0.4, dense_mode="bi-encoder"):
+                          logit_threshold=0.0, filter_stopwords=False, beta=0.4, dense_mode="bi-encoder",
+                          use_prf=False, prf_k=3, prf_alpha=0.3):
     """Evaluate hybrid V-SPLADE student + dense (CLIP / Sentence-Transformers) retrieval on a single split."""
     print(f"\nEvaluating split: '{split_name}' with beta = {beta} (is_clip = {is_clip})...")
     
@@ -236,7 +237,22 @@ def evaluate_split_hybrid(model, tokenizer, query_lut, dense_model, dense_proces
         with torch.no_grad():
             w_q_weights = F.softplus(query_lut[query_token_ids]).cpu()
             w_q[query_token_ids] = w_q_weights
-        scores_sparse = torch.sum(w_q.unsqueeze(0) * w_p_all, dim=1).to(device) # (num_docs,)
+        scores_sparse = torch.sum(w_q.unsqueeze(0) * w_p_all, dim=1) # Keep on CPU for PRF calculation
+        
+        if use_prf:
+            # Pseudo-Relevance Feedback (PRF)
+            top_k_indices = torch.topk(scores_sparse, k=min(prf_k, len(scores_sparse))).indices
+            feedback_docs = w_p_all[top_k_indices] # shape: [K, vocab_size]
+            w_q_feedback = torch.mean(feedback_docs, dim=0) # shape: [vocab_size]
+            w_q_expanded = (1.0 - prf_alpha) * w_q + prf_alpha * w_q_feedback
+            # Prune to top 20 active tokens
+            top_vals, top_inds = torch.topk(w_q_expanded, k=20)
+            w_q_pruned = torch.zeros_like(w_q_expanded)
+            w_q_pruned[top_inds] = top_vals
+            # Recalculate sparse scores (Pass 2)
+            scores_sparse = torch.sum(w_q_pruned.unsqueeze(0) * w_p_all, dim=1)
+            
+        scores_sparse = scores_sparse.to(device)
         
         # --- 2. Compute Dense Scores via FAISS or Batched Late-Interaction ---
         with torch.no_grad():
@@ -351,6 +367,9 @@ def main():
     parser.add_argument("--model", type=str, default="qwen-1.5b", help="Model key of the student backbone")
     parser.add_argument("--dense-model", type=str, default="openai/clip-vit-base-patch32", help="Pretrained dense model key (e.g. openai/clip-vit-base-patch32 or sentence-transformers/all-MiniLM-L6-v2)")
     parser.add_argument("--dense-mode", type=str, default="bi-encoder", choices=["bi-encoder", "late-interaction"], help="Embedding matching architecture mode")
+    parser.add_argument("--use-prf", action="store_true", help="Enable two-pass Pseudo-Relevance Feedback (PRF) query expansion")
+    parser.add_argument("--prf-k", type=int, default=3, help="Number of documents to use for PRF feedback")
+    parser.add_argument("--prf-alpha", type=float, default=0.3, help="Interpolation weight for PRF feedback vector")
     parser.add_argument("--dataset", type=str, default="mm-bright/MM-BRIGHT", help="Dataset name on Hugging Face")
     parser.add_argument("--test-splits", type=str, default="academia,biology,physics,philosophy,psychology,quant,quantumcomputing,robotics,law", help="Comma-separated list of held-out splits to evaluate")
     parser.add_argument("--batch-size", type=int, default=32, help="Batch size for V-SPLADE document encoding")
@@ -402,7 +421,7 @@ def main():
             model, tokenizer, query_lut, dense_model, dense_processor, is_clip, device, 
             args.dataset, split, batch_size=args.batch_size, dense_batch_size=args.dense_batch_size, 
             logit_threshold=args.logit_threshold, filter_stopwords=args.filter_stopwords, beta=args.beta,
-            dense_mode=args.dense_mode
+            dense_mode=args.dense_mode, use_prf=args.use_prf, prf_k=args.prf_k, prf_alpha=args.prf_alpha
         )
         if res:
             mrr, ndcg = res
