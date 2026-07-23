@@ -49,6 +49,25 @@ def min_max_normalize(scores):
         return (scores - s_min) / (s_max - s_min)
     return torch.zeros_like(scores)
 
+def load_colbert_projection(model_name, device):
+    """Load the ColBERT projection layer (linear.weight) from HF checkpoint if available."""
+    try:
+        from huggingface_hub import hf_hub_download
+        from safetensors.torch import load_file
+        try:
+            weights_file = hf_hub_download(repo_id=model_name, filename='model.safetensors')
+            state = load_file(weights_file)
+        except Exception:
+            weights_file = hf_hub_download(repo_id=model_name, filename='pytorch_model.bin')
+            state = torch.load(weights_file, map_location="cpu")
+            
+        if 'linear.weight' in state:
+            print("Loaded ColBERT linear projection weights from checkpoint.")
+            return state['linear.weight'].to(device)
+    except Exception as e:
+        pass
+    return None
+
 def evaluate_split_hybrid(model, tokenizer, query_lut, dense_model, dense_processor, is_clip, device, 
                           dataset_name, split_name, batch_size=32, dense_batch_size=256, 
                           logit_threshold=0.0, filter_stopwords=False, beta=0.4, dense_mode="bi-encoder"):
@@ -72,6 +91,7 @@ def evaluate_split_hybrid(model, tokenizer, query_lut, dense_model, dense_proces
     model.eval()
     dense_model.eval()
     vocab_size = model.config.vocab_size
+    colbert_proj = load_colbert_projection(dense_model.config._name_or_path, device)
     
     print("Encoding corpus documents (V-SPLADE and Dense)...")
     with torch.no_grad():
@@ -149,6 +169,8 @@ def evaluate_split_hybrid(model, tokenizer, query_lut, dense_model, dense_proces
                 outputs = dense_model(**inputs)
                 
                 token_embeddings = outputs[0]
+                if colbert_proj is not None:
+                    token_embeddings = torch.matmul(token_embeddings, colbert_proj.t())
                 if dense_mode == "late-interaction":
                     norm_tokens = F.normalize(token_embeddings, p=2, dim=-1)
                     for b_idx in range(len(doc_texts)):
@@ -246,6 +268,8 @@ def evaluate_split_hybrid(model, tokenizer, query_lut, dense_model, dense_proces
                 q_outputs = dense_model(**q_inputs)
                 
                 token_embeddings = q_outputs[0]
+                if colbert_proj is not None:
+                    token_embeddings = torch.matmul(token_embeddings, colbert_proj.t())
                 if dense_mode == "late-interaction":
                     q_norm_tokens = F.normalize(token_embeddings, p=2, dim=-1)
                     q_mask = q_inputs['attention_mask'][0] == 1
