@@ -127,7 +127,7 @@ def parse_stage4_response(response: str) -> tuple[str, float]:
 
 def main():
     parser = argparse.ArgumentParser(description="HIVE Phase 1: Offline Teacher Target Generation")
-    parser.add_argument("--model", type=str, default="nvidia/nvidia/llama-3.1-nemotron-70b-instruct", help="Model key to load from src/models.py or NIM API path")
+    parser.add_argument("--model", type=str, default="nvidia/meta/llama-3.1-70b-instruct", help="Model key to load from src/models.py or NIM API path")
     parser.add_argument("--dataset", type=str, default="nfcorpus", help="Dataset name: 'nfcorpus', 'mm-bright/MM-BRIGHT', or a Hugging Face dataset ID")
     parser.add_argument("--split", type=str, default=None, help="Hugging Face dataset split/domain name (e.g. 'academia', or 'all' for all MM-BRIGHT splits)")
     parser.add_argument("--num-queries", type=int, default=10, help="Number of queries to process per dataset split")
