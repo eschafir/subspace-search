@@ -42,7 +42,7 @@ def run_llm_inference(prompt: str, model, tokenizer, device: str, max_new_tokens
             api_key=api_key
         )
         
-        nim_model_name = model.replace("nvidia/", "")
+        nim_model_name = model[7:]
         
         # Try with primary model (up to 3 retries)
         for attempt in range(3):
@@ -127,7 +127,7 @@ def parse_stage4_response(response: str) -> tuple[str, float]:
 
 def main():
     parser = argparse.ArgumentParser(description="HIVE Phase 1: Offline Teacher Target Generation")
-    parser.add_argument("--model", type=str, default="nvidia/meta/llama-3.3-70b-instruct", help="Model key to load from src/models.py or NIM API path")
+    parser.add_argument("--model", type=str, default="nvidia/nvidia/llama-3.1-nemotron-70b-instruct", help="Model key to load from src/models.py or NIM API path")
     parser.add_argument("--dataset", type=str, default="nfcorpus", help="Dataset name: 'nfcorpus', 'mm-bright/MM-BRIGHT', or a Hugging Face dataset ID")
     parser.add_argument("--split", type=str, default=None, help="Hugging Face dataset split/domain name (e.g. 'academia', or 'all' for all MM-BRIGHT splits)")
     parser.add_argument("--num-queries", type=int, default=10, help="Number of queries to process per dataset split")
