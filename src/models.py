@@ -31,6 +31,7 @@ def best_gpu() -> str:
 MODELS = {
     "qwen-1.5b": "Qwen/Qwen2.5-1.5B-Instruct",
     "qwen-3b":   "Qwen/Qwen2.5-3B-Instruct",
+    "qwen-7b":   "Qwen/Qwen2.5-7B-Instruct",
     "qwen-32b":  "Qwen/Qwen2.5-32B-Instruct",
 }
 
