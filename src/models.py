@@ -41,21 +41,10 @@ def load(name: str, device: str = "cuda", dtype=torch.bfloat16):
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
         
-    # For large models like 32B, check if requested single GPU has enough free VRAM (~65GB)
-    # If not, fall back to device_map="auto" across available GPUs
-    dev_map = device
-    if "32b" in name.lower() and isinstance(device, str) and device.startswith("cuda:"):
-        gpu_idx = int(device.split(":")[1])
-        free_bytes, _ = torch.cuda.mem_get_info(gpu_idx)
-        free_gb = free_bytes / (1024 ** 3)
-        if free_gb < 64.0:
-            print(f"  Notice: {device} has {free_gb:.1f} GB free (< 64 GB needed for 32B model). Using device_map='auto'.")
-            dev_map = "auto"
-        
     model = AutoModelForCausalLM.from_pretrained(
         model_id, 
         torch_dtype=dtype, 
-        device_map=dev_map,
+        device_map=device,
         low_cpu_mem_usage=True,
         attn_implementation="sdpa"  # Native PyTorch memory-efficient attention
     )
