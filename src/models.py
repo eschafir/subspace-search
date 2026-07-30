@@ -45,6 +45,7 @@ def load(name: str, device: str = "cuda", dtype=torch.bfloat16):
         model_id, 
         torch_dtype=dtype, 
         device_map=device,
+        low_cpu_mem_usage=True,
         attn_implementation="sdpa"  # Native PyTorch memory-efficient attention
     )
     model.eval()
