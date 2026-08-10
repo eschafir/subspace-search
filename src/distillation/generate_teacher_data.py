@@ -234,7 +234,15 @@ def main():
                 try:
                     corpus_ds = load_dataset(dataset_prefix, "corpus", split="corpus")
                     queries_ds = load_dataset(dataset_prefix, "queries", split="queries")
-                    qrels_ds = load_dataset(qrels_dataset, split=split_name)
+                    try:
+                        qrels_ds = load_dataset(qrels_dataset, split=split_name)
+                    except Exception:
+                        if split_name in ["dev", "val"]:
+                            target_split = "validation"
+                        else:
+                            target_split = "test"
+                        print(f"  Note: Split '{split_name}' not directly found in '{qrels_dataset}'. Falling back to '{target_split}'.")
+                        qrels_ds = load_dataset(qrels_dataset, split=target_split)
                 except Exception as e:
                     print(f"Error loading BEIR dataset '{args.dataset}': {e}")
                     continue
