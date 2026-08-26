@@ -27,8 +27,38 @@ def clean_html(text: str) -> str:
     text = text.replace("&lt;", "<").replace("&gt;", ">").replace("&amp;", "&").replace("&quot;", '"').replace("&#39;", "'")
     return text.strip()
 
-def run_llm_inference(prompt: str, model, tokenizer, device: str, max_new_tokens: int = 128) -> str:
-    """Helper to run inference on local Qwen or custom HF model, or Nvidia NIM API."""
+def run_llm_inference(prompt: str, model, tokenizer, device: str, max_new_tokens: int = 128, vllm_url: str = "http://localhost:8000/v1") -> str:
+    """Helper to run inference on local Qwen/HF model, Nvidia NIM API, or local vLLM instance."""
+    if isinstance(model, str) and model.startswith("vllm/"):
+        # Local vLLM OpenAI-compatible API call
+        from openai import OpenAI
+        import time
+        client = OpenAI(
+            base_url=vllm_url,
+            api_key="EMPTY"
+        )
+        vllm_model_name = model[5:]
+        for attempt in range(3):
+            try:
+                response = client.chat.completions.create(
+                    model=vllm_model_name,
+                    messages=[
+                        {"role": "system", "content": "You are a helpful, logical AI search assistant."},
+                        {"role": "user", "content": prompt}
+                    ],
+                    temperature=0.0,
+                    max_tokens=max_new_tokens
+                )
+                msg = response.choices[0].message
+                content = msg.content or getattr(msg, "reasoning_content", None)
+                if content and content.strip():
+                    return content.strip()
+            except Exception as e:
+                print(f"  Attempt {attempt+1} failed for vLLM model {vllm_model_name}: {e}.")
+                if attempt < 2:
+                    time.sleep(2)
+        return "[Inference Failed]"
+        
     if isinstance(model, str) and model.startswith("nvidia/"):
         # Nvidia NIM API call
         from openai import OpenAI
@@ -127,7 +157,8 @@ def parse_stage4_response(response: str) -> tuple[str, float]:
 
 def main():
     parser = argparse.ArgumentParser(description="HIVE Phase 1: Offline Teacher Target Generation")
-    parser.add_argument("--model", type=str, default="nvidia/meta/llama-3.1-70b-instruct", help="Model key to load from src/models.py or NIM API path")
+    parser.add_argument("--model", type=str, default="nvidia/meta/llama-3.1-70b-instruct", help="Model key to load from src/models.py, NIM API ('nvidia/...'), or vLLM ('vllm/...')")
+    parser.add_argument("--vllm-url", type=str, default="http://localhost:8000/v1", help="Base URL for local vLLM OpenAI-compatible server")
     parser.add_argument("--dataset", type=str, default="nfcorpus", help="Dataset name: 'nfcorpus', 'mm-bright/MM-BRIGHT', or a Hugging Face dataset ID")
     parser.add_argument("--split", type=str, default=None, help="Hugging Face dataset split/domain name (e.g. 'academia', or 'all' for all MM-BRIGHT splits)")
     parser.add_argument("--num-queries", type=int, default=10, help="Number of queries to process per dataset split")
@@ -137,6 +168,11 @@ def main():
     
     if args.model.startswith("nvidia/"):
         print(f"Using Nvidia NIM API model: {args.model}")
+        model = args.model
+        tokenizer = None
+        device = "cpu"
+    elif args.model.startswith("vllm/"):
+        print(f"Using local vLLM endpoint ({args.vllm_url}) with model: {args.model[5:]}")
         model = args.model
         tokenizer = None
         device = "cpu"
@@ -380,7 +416,7 @@ def main():
                 f"Output ONLY the synthesized compensatory query, with no other text."
             )
             print("Running Stage 2: Compensatory Query Synthesis...")
-            comp_query = run_llm_inference(stage2_prompt, model, tokenizer, device, max_new_tokens=64)
+            comp_query = run_llm_inference(stage2_prompt, model, tokenizer, device, max_new_tokens=64, vllm_url=args.vllm_url)
             print(f"  Compensatory Query: '{comp_query}'")
             
             # 3. HIVE Stage 3: Secondary Retrieval
@@ -426,7 +462,7 @@ def main():
                     f"Score: <number from 0.0 to 5.0>"
                 )
                 print(f"  Verifying Doc {doc_id} (Is Ground Truth: {is_ground_truth})...")
-                verification_output = run_llm_inference(stage4_prompt, model, tokenizer, device, max_new_tokens=512)
+                verification_output = run_llm_inference(stage4_prompt, model, tokenizer, device, max_new_tokens=512, vllm_url=args.vllm_url)
                 
                 rationale, score = parse_stage4_response(verification_output)
                 rationales[doc_id] = rationale
