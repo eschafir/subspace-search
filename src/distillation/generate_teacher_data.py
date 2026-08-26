@@ -66,7 +66,7 @@ def run_llm_inference(prompt: str, model, tokenizer, device: str, max_new_tokens
                     time.sleep(2)
             
         # Fallback if primary model failed or returned empty content after retries
-        fallback_model = "meta/llama-3.3-70b-instruct"
+        fallback_model = "meta/llama-3.1-70b-instruct"
         print(f"  Warning: Primary NIM model {nim_model_name} returned empty or failed. Querying fallback {fallback_model}...")
         for attempt in range(3):
             try:
